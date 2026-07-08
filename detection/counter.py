@@ -10,6 +10,9 @@ import numpy as np
 class MouseCounter:
     """在 ROI C 内估计小鼠数量的引擎"""
 
+    # ---- cap=2 硬约束 ----
+    MAX_WARM_SPOT_OCCUPANTS = 2
+
     # ---- occupancy_mask 参数 (宽松, 用于占据检测; 此处保留供参考) ----
     DARK_V_THRESHOLD = 80
     BG_DIFF_THRESHOLD = 30
@@ -45,7 +48,7 @@ class MouseCounter:
         self._area_p95: float | None = None
         self._count_area_refs: dict[int, float] = {}  # {1: 800, 2: 1600, ...} 用户标记的多鼠参考面积
         # 多帧面积样本 (Phase 1+2): {1: [...], 2: [...], 3: [...], 4: [...]}
-        self._count_area_samples: dict[int, list[float]] = {1: [], 2: [], 3: [], 4: []}
+        self._count_area_samples: dict[int, list[float]] = {1: [], 2: []}
 
     # ------------------------------------------------------------------
     # 主入口: 估计当前帧小鼠数量
@@ -53,19 +56,20 @@ class MouseCounter:
     def estimate_count(
         self,
         frame_bgr: np.ndarray,
-        roi_a: dict,
-        roi_c_scale: float,
+        roi_core: dict,
+        roi_count: dict | None,
         background_bgr: np.ndarray | None = None,
     ) -> dict:
         """
         估计当前帧中参与占据暖点的小鼠数量
 
         :param frame_bgr:     当前帧 BGR 图像
-        :param roi_a:         ROI A 参数字典 {cx, cy, a, b, angle}
-        :param roi_c_scale:   ROI C 外扩倍数 (相对于 ROI A)
+        :param roi_core:      ROI Core 参数字典 {cx, cy, a, b, angle} (内圈, 用于精查)
+        :param roi_count:     ROI Count 参数字典 {cx, cy, a, b, angle} (外圈, 用于计数区域)
+                              为 None 时自动使用 roi_core × 1.8
         :param background_bgr: 背景帧 BGR 图像
         :return: dict:
-            estimated_mouse_count   int (0-4)
+            estimated_mouse_count   int (0-2)
             count_by_blob           int
             count_by_area           int
             total_mouse_area        float
@@ -77,17 +81,23 @@ class MouseCounter:
             debug_blobs             list   # 每个有效blob的调试信息
             decision_reason         str    # 最终判定原因
         """
-        # ---- 1. 截取 ROI C 区域 ----
+        # ---- 1. 截取 ROI Count 区域 (计数用外圈) ----
         h, w = frame_bgr.shape[:2]
-        cx, cy = roi_a["cx"], roi_a["cy"]
-        a, b = roi_a["a"], roi_a["b"]
+        if roi_count is None:
+            # fallback: 使用 roi_core × 1.8
+            roi_count = {
+                "cx": roi_core["cx"], "cy": roi_core["cy"],
+                "a": roi_core["a"] * 1.8, "b": roi_core["b"] * 1.8,
+                "angle": roi_core.get("angle", 0.0),
+            }
 
-        c_a = a * roi_c_scale
-        c_b = b * roi_c_scale
-        x1 = max(0, int(cx - c_a))
-        y1 = max(0, int(cy - c_b))
-        x2 = min(w, int(cx + c_a))
-        y2 = min(h, int(cy + c_b))
+        cx_count, cy_count = roi_count["cx"], roi_count["cy"]
+        c_a = roi_count["a"]
+        c_b = roi_count["b"]
+        x1 = max(0, int(cx_count - c_a))
+        y1 = max(0, int(cy_count - c_b))
+        x2 = min(w, int(cx_count + c_a))
+        y2 = min(h, int(cy_count + c_b))
 
         if x2 <= x1 or y2 <= y1:
             return self._empty_result()
@@ -102,11 +112,15 @@ class MouseCounter:
         # ---- 2. 创建椭圆 mask ----
         cx_crop = crop_w / 2.0
         cy_crop = crop_h / 2.0
-        angle = roi_a.get("angle", 0.0)
+        angle = roi_count.get("angle", 0.0)
 
-        roi_c_mask = self._create_ellipse_mask(crop_h, crop_w, cx_crop, cy_crop, c_a, c_b, angle)
-        roi_a_mask = self._create_ellipse_mask(crop_h, crop_w, cx_crop, cy_crop, a, b, angle)
-        roi_a_pixel_count = np.count_nonzero(roi_a_mask)
+        # ROI Count mask (外圈, 计数区域)
+        roi_count_mask = self._create_ellipse_mask(crop_h, crop_w, cx_crop, cy_crop, c_a, c_b, angle)
+        # ROI Core mask (内圈, 用于精查接触判定)
+        a_core = roi_core["a"]
+        b_core = roi_core["b"]
+        roi_core_mask = self._create_ellipse_mask(crop_h, crop_w, cx_crop, cy_crop, a_core, b_core, angle)
+        roi_core_pixel_count = np.count_nonzero(roi_core_mask)
 
         # ---- 3. 灰度与absdiff ----
         if not no_bg:
@@ -141,7 +155,7 @@ class MouseCounter:
             _, diff_gray = cv2.threshold(diff, self.COUNTING_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
 
             counting_mask = cv2.bitwise_or(strong_dark, cv2.bitwise_and(dark_candidate, diff_gray))
-        counting_mask = cv2.bitwise_and(counting_mask, counting_mask, mask=roi_c_mask)
+        counting_mask = cv2.bitwise_and(counting_mask, counting_mask, mask=roi_count_mask)
 
         # ---- 6. 形态学: 更大闭运算合并碎片 ----
         kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -183,12 +197,12 @@ class MouseCounter:
                 "label_id": label_id,
             })
 
-        # ---- 9. 检查每个blob是否与ROI A接触 (使用原始labels) ----
+        # ---- 9. 检查每个blob是否与ROI Core接触 (使用原始labels) ----
         for b in pre_blobs:
             b["touching_core"] = self._blob_touches_roi_a(
-                labels, b["label_id"], roi_a_mask, cleaned,
+                labels, b["label_id"], roi_core_mask, cleaned,
                 b["left"], b["top"], b["width"], b["height"],
-                roi_a_pixel_count
+                roi_core_pixel_count
             )
 
         # ---- 10. 碎片合并 ----
@@ -200,7 +214,7 @@ class MouseCounter:
         core_touching = [b for b in valid_blobs if b["touching_core"]]
         core_touching_blob_count = len(core_touching)
         count_by_blob = core_touching_blob_count if core_touching_blob_count >= 1 else 0
-        count_by_blob = min(4, count_by_blob)
+        count_by_blob = min(MouseCounter.MAX_WARM_SPOT_OCCUPANTS, count_by_blob)
 
         # 面积: 只用接触ROI A的blob
         total_mouse_area = sum(b["area"] for b in core_touching)
@@ -276,23 +290,19 @@ class MouseCounter:
     # ------------------------------------------------------------------
     @staticmethod
     def _area_threshold_count(area_ratio: float) -> int:
-        """面积保守阈值映射 (不用 round)"""
-        if area_ratio < 0.4:
+        """面积保守阈值映射 (cap=2: 0/1/2 三档)"""
+        if area_ratio < 0.3:
             return 0
         elif area_ratio < 1.7:
             return 1
-        elif area_ratio < 2.7:
-            return 2
-        elif area_ratio < 3.7:
-            return 3
         else:
-            return 4
+            return 2
 
     def _get_count_area_ref_strategy(self) -> dict[int, float]:
         """
         获取各数量的参考面积策略:
         - count=1: P80 from _count_area_samples[1]
-        - count=2-4: median from _count_area_samples[count]
+        - count=2: median from _count_area_samples[2]
         """
         return dict(self._count_area_refs)
 
@@ -303,28 +313,26 @@ class MouseCounter:
                              count_area_refs: dict[int, float] | None = None,
                              single_mouse_area_ref: float | None = None) -> tuple[int, float]:
         """
-        保守综合计数
-        核心原则: 单个blob永远不能判成3或4只
-        改进: 当用户标记了2/3/4只参考帧时, 比对当前帧面积与各参考面积,
-              选用最接近的参考作为计数结果
+        保守综合计数 (cap=2 硬约束)
+        向前兼容: 旧数据中 count=3/4 降级为 2
 
         :return: (estimated_mouse_count, count_confidence)
         """
         if count_by_blob == 0:
             return 0, 0.9
         if not has_area_ref or area_ratio is None:
-            return min(count_by_blob, 4), 0.6
+            return min(count_by_blob, MouseCounter.MAX_WARM_SPOT_OCCUPANTS), 0.6
 
-        # ---- 多鼠参考面积匹配 (改进) ----
-        # 当只有一个身体簇且存在多鼠参考面积时, 比对面积选择最佳匹配
+        # ---- 多鼠参考面积匹配 ----
         if count_by_blob == 1 and count_area_refs and len(count_area_refs) >= 1:
             best_count, best_deviation = MouseCounter._find_best_area_match(
                 total_mouse_area, area_ratio, count_area_refs, single_mouse_area_ref
             )
+            # cap=2: 降级旧数据 3/4 → 2
+            best_count = min(best_count, MouseCounter.MAX_WARM_SPOT_OCCUPANTS)
             if best_deviation < 0.35:
                 conf = min(0.8, max(0.3, 1.0 - best_deviation))
                 return best_count, conf
-            # else: 最佳匹配偏差 >= 35%, 回退到原有保守逻辑
 
         area_count = MouseCounter._area_threshold_count(area_ratio)
 
@@ -332,18 +340,13 @@ class MouseCounter:
         if count_by_blob == 1:
             if area_ratio < 1.7:
                 return 1, 0.85
-            elif area_ratio < 2.7:
-                return 2, 0.35  # 低置信
             else:
-                return 2, 0.25  # 极低置信 — 单个大团不可能确认3只
+                return 2, 0.35  # 低置信 — 单个大团判2只
 
-        # 两个簇
-        if count_by_blob == 2:
-            return min(max(count_by_blob, area_count), 3), \
-                0.75 if area_count <= 2 else 0.5
-
-        # 三个及以上
-        return min(count_by_blob, 4), 0.7
+        # 两个及以上簇: cap=2
+        result = max(count_by_blob, area_count)
+        result = min(result, MouseCounter.MAX_WARM_SPOT_OCCUPANTS)
+        return result, 0.75 if result <= 2 else 0.5
 
     @staticmethod
     def _find_best_area_match(
@@ -379,19 +382,15 @@ class MouseCounter:
     def _build_decision_reason(count_by_blob: int, count_by_area: int,
                                 area_ratio: float | None, has_area_ref: bool,
                                 final_count: int) -> str:
-        """构建判定原因字符串"""
+        """构建判定原因字符串 (cap=2)"""
         if final_count == 0:
             return "no_mouse"
         if count_by_blob == 1 and has_area_ref and area_ratio is not None:
             if area_ratio < 1.7:
                 return "single_cluster_normal"
-            elif area_ratio < 2.7:
-                return "single_cluster_low_confidence"
             else:
-                return "single_cluster_very_low_confidence"
-        if count_by_blob == 2:
-            return "two_clusters_confirmed"
-        if count_by_blob >= 3:
+                return "single_cluster_large_area"
+        if count_by_blob >= 2:
             return "multi_clusters_confirmed"
         return f"blob_{count_by_blob}_area_{count_by_area}"
 
@@ -534,14 +533,14 @@ class MouseCounter:
             self._area_p50 = float(np.percentile(area_samples, 50))
             self._area_p95 = float(np.percentile(area_samples, 95))
 
-    def calibrate_from_frame(self, frame_bgr, roi_a, roi_c_scale,
+    def calibrate_from_frame(self, frame_bgr, roi_core, roi_count,
                              background_bgr) -> float | None:
         """
         从指定帧校准单鼠面积 (取最大blob面积)
 
         :return: 估计的单鼠面积 (像素), 或 None
         """
-        result = self.estimate_count(frame_bgr, roi_a, roi_c_scale, background_bgr)
+        result = self.estimate_count(frame_bgr, roi_core, roi_count, background_bgr)
         largest_blob = result.get("largest_blob_area", 0)
         if largest_blob > self.MIN_BODY_AREA:
             self._single_mouse_area_ref = largest_blob
@@ -575,7 +574,7 @@ class MouseCounter:
 
     def clear_all_count_area_samples(self):
         """清空所有面积样本"""
-        for k in self._count_area_samples:
+        for k in list(self._count_area_samples.keys()):
             self._count_area_samples[k] = []
         self._count_area_refs = {}
         self._single_mouse_area_ref = None
@@ -585,7 +584,7 @@ class MouseCounter:
         return list(self._count_area_samples.get(count, []))
 
     def _recompute_count_area_ref(self, count: int):
-        """从样本重算单一数量的参考值 (count=1用P80, 2-4用median)"""
+        """从样本重算单一数量的参考值 (count=1用P80, count=2用median)"""
         samples = self._count_area_samples.get(count, [])
         if not samples:
             self._count_area_refs.pop(count, None)
@@ -610,6 +609,10 @@ class MouseCounter:
         new._area_p95 = self._area_p95
         new._count_area_refs = dict(self._count_area_refs)
         new._count_area_samples = {k: list(v) for k, v in self._count_area_samples.items()}
+        # 向前兼容: clone 时只保留 cap=2 范围内的键
+        for k in list(new._count_area_samples.keys()):
+            if k > MouseCounter.MAX_WARM_SPOT_OCCUPANTS:
+                del new._count_area_samples[k]
         return new
 
     def get_area_stats(self) -> dict:
@@ -656,6 +659,8 @@ class MouseCounter:
     def _empty_result() -> dict:
         """无有效前景时的空结果 (0只小鼠)"""
         return {
+            "error": True,
+            "computed": False,
             "estimated_mouse_count": 0,
             "count_by_blob": 0,
             "count_by_area": 0,

@@ -149,40 +149,23 @@ class EventListWidget(QWidget):
         """
         self._segments = []
         for i, evt in enumerate(events):
-            # 检测是否为 CountSegment (有 estimated_mouse_count 字段)
-            is_count_segment = "estimated_mouse_count" in evt
-
-            seg = {
-                "segment_id": evt.get("segment_id", i + 1),
-                "episode_id": evt.get("episode_id", ""),
-                "start_time": evt.get("start_time", evt.get("start_time_sec", 0.0)),
-                "end_time": evt.get("end_time", evt.get("end_time_sec", 0.0)),
-                "duration": evt.get("duration", evt.get("duration_sec", 0.0)),
-                "start_frame": evt.get("start_frame", 0),
-                "end_frame": evt.get("end_frame", 0),
-                "review_start_frame": evt.get("review_start_frame",
-                                               evt.get("start_frame", 0)),
-                "review_end_frame": evt.get("review_end_frame",
-                                             evt.get("end_frame", 0)),
-                "review_start_time": evt.get("review_start_time",
-                                              evt.get("start_time", 0.0)),
-                "review_end_time": evt.get("review_end_time",
-                                            evt.get("end_time", 0.0)),
-                "status": evt.get("status", evt.get("count_status", "pending")),
-                "mouse_ids": evt.get("mouse_ids", []),
-                "confidence": evt.get("confidence",
-                                      evt.get("count_confidence", 0.0)),
-                "avg_occ_ratio": evt.get("avg_occ_ratio", 0.0),
-                "max_occ_ratio": evt.get("max_occ_ratio", 0.0),
-                "note": evt.get("note", ""),
-                # CountSegment 特有字段
-                "estimated_mouse_count": evt.get("estimated_mouse_count", None),
-                "confirmed_mouse_count": evt.get("confirmed_mouse_count", None),
-                "count_confidence": evt.get("count_confidence", 0.0),
-                "count_status": evt.get("count_status", "pending"),
-                "detected_by": evt.get("detected_by", "auto"),
-                "modified_by_user": evt.get("modified_by_user", False),
-            }
+            seg = dict(evt)  # 浅拷贝保留所有原始字段
+            # 确保 UI 需要的字段有默认值
+            seg.setdefault("segment_id", i + 1)
+            seg.setdefault("start_time", evt.get("start_time_sec", 0.0))
+            seg.setdefault("end_time", evt.get("end_time_sec", 0.0))
+            seg.setdefault("duration", evt.get("duration_sec", 0.0))
+            seg.setdefault("review_start_frame", evt.get("start_frame", 0))
+            seg.setdefault("review_end_frame", evt.get("end_frame", 0))
+            seg.setdefault("review_start_time", evt.get("start_time", 0.0))
+            seg.setdefault("review_end_time", evt.get("end_time", 0.0))
+            seg.setdefault("status", evt.get("count_status", "pending"))
+            seg.setdefault("confidence", evt.get("count_confidence", 0.0))
+            seg.setdefault("is_short_event", False)
+            seg.setdefault("estimated_mouse_count", None)
+            seg.setdefault("confirmed_mouse_count", None)
+            seg.setdefault("detected_by", "auto")
+            seg.setdefault("modified_by_user", False)
             self._segments.append(seg)
 
         self._refresh_table()
@@ -271,16 +254,63 @@ class EventListWidget(QWidget):
             self._update_row(row_idx)
 
     def _update_row(self, row_idx: int):
-        """更新单行"""
+        """更新单行 — Phase 6: 行颜色状态"""
         if row_idx < 0 or row_idx >= len(self._segments):
             return
         seg = self._segments[row_idx]
-        color = self.STATUS_COLORS.get(seg["status"], QColor(180, 180, 40))
+
+        # ---- Phase 6: 行背景颜色优先级 ----
+        status = seg.get("count_status", seg.get("status", "pending"))
+        needs_review = seg.get("needs_review", False)
+        identity_conflict = seg.get("identity_conflict", False)
+        is_false_positive = seg.get("is_possible_false_positive", False)
+        est_count = seg.get("estimated_mouse_count")
         count_confidence = seg.get("count_confidence", 0.0)
+
+        # 行颜色判定 (优先级从高到低)
+        if status == "rejected" or identity_conflict:
+            row_color = QColor(220, 60, 60)     # 红: 误检/冲突
+        elif count_confidence > 0 and count_confidence < 0.5:
+            row_color = QColor(255, 140, 0)     # 橙: 低置信
+        elif needs_review:
+            row_color = QColor(255, 200, 50)    # 黄: 待审核/需审核
+        elif status == "confirmed":
+            row_color = QColor(60, 180, 60)     # 绿: 已确认
+        elif status == "modified":
+            row_color = QColor(160, 60, 200)    # 紫: 已修改
+        elif status == "manual":
+            row_color = QColor(60, 120, 220)    # 蓝: 人工新增
+        elif est_count == 0:
+            row_color = QColor(150, 150, 150)   # 灰: count=0
+        else:
+            row_color = QColor(180, 180, 40)    # 默认: 黄/待确认
+
+        # Phase 6: 设置行前景色
+        for col in range(self.COL_COUNT):
+            item = self._table.item(row_idx, col)
+            if item is not None:
+                item.setForeground(QBrush(QColor(0xdd, 0xdd, 0xdd)))
+
+        # Phase 6: 行背景提示色 (通过状态列展示)
+        color = row_color
+
+        # 工具提示: 显示额外标记
+        tooltip_parts = []
+        if seg.get("needs_review"):
+            tooltip_parts.append("⚠ 需审核")
+        if seg.get("identity_conflict"):
+            tooltip_parts.append("❌ 身份冲突")
+        if seg.get("is_possible_false_positive"):
+            tooltip_parts.append("🔍 可能误检")
+        if seg.get("is_short_event"):
+            tooltip_parts.append("⏱ 短事件")
+        tooltip = "\n".join(tooltip_parts) if tooltip_parts else ""
 
         # ID
         id_item = QTableWidgetItem(str(seg["segment_id"]))
         id_item.setTextAlignment(Qt.AlignCenter)
+        if tooltip:
+            id_item.setToolTip(tooltip)
         self._table.setItem(row_idx, self.COL_ID, id_item)
 
         # 开始时间 (MM:SS.ms)
@@ -296,6 +326,12 @@ class EventListWidget(QWidget):
         # 时长
         dur_item = QTableWidgetItem(f"{seg['duration']:.2f}")
         dur_item.setTextAlignment(Qt.AlignCenter)
+        # Phase 3: 短事件橙色标记
+        if seg.get("is_short_event"):
+            dur_item.setForeground(QBrush(self.LOW_CONFIDENCE_COLOR))
+            font = dur_item.font()
+            font.setBold(True)
+            dur_item.setFont(font)
         self._table.setItem(row_idx, self.COL_DURATION, dur_item)
 
         # 估计数量 (改进.md 11.2 节)
@@ -334,18 +370,22 @@ class EventListWidget(QWidget):
             conf_val_item.setForeground(QBrush(self.LOW_CONFIDENCE_COLOR))
         self._table.setItem(row_idx, self.COL_CONFIDENCE, conf_val_item)
 
-        # 状态
-        status_text = self.STATUS_LABELS.get(seg["status"], seg["status"])
-        # 对于 CountSegment 使用 count_status
+        # 状态 — Phase 6: 使用 row_color 统一显示
         count_status = seg.get("count_status")
-        if count_status:
-            count_color = self.COUNT_STATUS_COLORS.get(count_status, color)
-            status_text = self.STATUS_LABELS.get(count_status, count_status)
-        else:
-            count_color = color
+        display_status = seg.get("count_status", seg.get("status", "pending"))
+        status_text = self.STATUS_LABELS.get(display_status, display_status)
+        # 额外标签
+        if seg.get("needs_review"):
+            status_text += " ⚠"
+        if seg.get("identity_conflict"):
+            status_text += " ❌"
+        if seg.get("is_possible_false_positive"):
+            status_text += " 🔍"
         status_item = QTableWidgetItem(status_text)
         status_item.setTextAlignment(Qt.AlignCenter)
-        status_item.setForeground(QBrush(count_color))
+        status_item.setForeground(QBrush(color))
+        if tooltip:
+            status_item.setToolTip(tooltip)
         self._table.setItem(row_idx, self.COL_STATUS, status_item)
 
     # ------------------------------------------------------------------

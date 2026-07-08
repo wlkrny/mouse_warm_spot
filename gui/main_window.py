@@ -6,6 +6,7 @@
 
 import os
 import time
+import traceback
 import cv2
 import numpy as np
 
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QLineEdit, QStatusBar,
     QFileDialog, QMessageBox, QDockWidget, QToolBar, QMenuBar, QMenu,
-    QApplication, QSplitter, QSizePolicy, QProgressBar,
+    QApplication, QSplitter, QSizePolicy, QProgressBar, QProgressDialog, QInputDialog,
 )
 
 from .video_widget import VideoWidget
@@ -27,6 +28,8 @@ from .calibration_store import CalibrationStore, CalibrationSample
 from detection.metrics import DetectionMetrics
 from detection.engine import DetectionEngine
 from detection.counter import MouseCounter
+from detection.identity_assist import IdentityAssist, apply_identity_to_segment
+from export.csv_exporter import CsvExporter
 
 
 # =========================================================================
@@ -50,6 +53,7 @@ class DetectionWorker(QThread):
         self._params = params
 
     def run(self):
+        cap = None
         try:
             cap = cv2.VideoCapture(self._video_path)
             if not cap.isOpened():
@@ -65,11 +69,13 @@ class DetectionWorker(QThread):
                 progress_callback=lambda pct, msg: self.progress_signal.emit(pct, msg),
             )
 
-            cap.release()
             self.finished_signal.emit(events)
 
         except Exception as e:
-            self.error_signal.emit(str(e))
+            self.error_signal.emit(f"{e}\n{traceback.format_exc()}")
+        finally:
+            if cap is not None:
+                cap.release()
 
 
 class DetectionWorkerWithCounting(QThread):
@@ -92,6 +98,7 @@ class DetectionWorkerWithCounting(QThread):
         self._counter = counter
 
     def run(self):
+        cap = None
         try:
             cap = cv2.VideoCapture(self._video_path)
             if not cap.isOpened():
@@ -108,11 +115,52 @@ class DetectionWorkerWithCounting(QThread):
                 counter=self._counter,
             )
 
-            cap.release()
             self.finished_signal.emit(episodes, segments)
 
         except Exception as e:
-            self.error_signal.emit(str(e))
+            self.error_signal.emit(f"{e}\n{traceback.format_exc()}")
+        finally:
+            if cap is not None:
+                cap.release()
+
+
+class ColorIdentifyWorker(QThread):
+    """后台颜色识别线程 — 不阻塞 UI"""
+    progress = Signal(int, str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, segment, roi_core, video_path, fps, parent=None):
+        super().__init__(parent)
+        self.segment = segment
+        self.roi_core = roi_core
+        self._video_path = video_path
+        self.fps = fps
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(self._video_path)
+            if not cap.isOpened():
+                self.error.emit(f"无法打开视频: {self._video_path}")
+                return
+            if self._cancelled:
+                return
+            assist = IdentityAssist(debug=True)
+            result = assist.detect_ear_tags(
+                segment=self.segment, roi_core=self.roi_core,
+                cap=cap, fps=self.fps
+            )
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(f"{e}\n{traceback.format_exc()}")
+        finally:
+            if cap is not None:
+                cap.release()
 
 
 # =========================================================================
@@ -141,11 +189,17 @@ class MainWindow(QMainWindow):
         self._episodes: list[dict] = []     # 占据大事件 (改进.md)
         self._count_segments: list[dict] = []  # 计数子片段 (改进.md)
 
+        # 身份识别线程
+
         # 校准标记系统 (Phase 1+2: CalibrationStore 接管)
         self._calib_store = CalibrationStore()
 
         # 当前审核事件索引
         self._current_review_idx: int = -1
+
+        # Phase 10: Debug view
+        self._debug_view_enabled: bool = False
+        self._debug_data: dict = {}
 
         # ---- 构建 UI ----
         self._setup_central()
@@ -208,6 +262,11 @@ class MainWindow(QMainWindow):
         export_md_action.triggered.connect(self._on_export_markdown)
         file_menu.addAction(export_md_action)
 
+        export_csv_action = QAction("导出CSV(&E)...", self)
+        export_csv_action.setShortcut(QKeySequence("Ctrl+E"))
+        export_csv_action.triggered.connect(self._on_export_csv)
+        file_menu.addAction(export_csv_action)
+
         file_menu.addSeparator()
 
         exit_action = QAction("退出(&X)", self)
@@ -223,6 +282,16 @@ class MainWindow(QMainWindow):
             view_menu.addAction(self._metrics_dock.toggleViewAction())
         if hasattr(self, '_annotation_dock'):
             view_menu.addAction(self._annotation_dock.toggleViewAction())
+
+        view_menu.addSeparator()
+
+        # Phase 10: Debug 视图开关
+        self._debug_view_action = QAction("Debug 视图(&D)", self)
+        self._debug_view_action.setCheckable(True)
+        self._debug_view_action.setChecked(False)
+        self._debug_view_action.setShortcut(QKeySequence("Ctrl+D"))
+        self._debug_view_action.triggered.connect(self._on_toggle_debug_view)
+        view_menu.addAction(self._debug_view_action)
 
     # ==================================================================
     # 工具栏
@@ -248,7 +317,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._btn_play)
 
         self._btn_prev = QPushButton("<<")
-        self._btn_prev.setToolTip("后退 10 帧 (A)")
+        self._btn_prev.setToolTip("快退 10 帧 (J)")
         self._btn_prev.clicked.connect(lambda: self._video_widget.jump_frames(-10))
         self._btn_prev.setMinimumHeight(30)
         toolbar.addWidget(self._btn_prev)
@@ -266,16 +335,16 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._btn_next1)
 
         self._btn_next = QPushButton(">>")
-        self._btn_next.setToolTip("前进 10 帧 (D)")
+        self._btn_next.setToolTip("快进 10 帧 (L)")
         self._btn_next.clicked.connect(lambda: self._video_widget.jump_frames(10))
         self._btn_next.setMinimumHeight(30)
         toolbar.addWidget(self._btn_next)
 
         toolbar.addSeparator()
 
-        # 校准帧标记按钮 [0] [1] [2] [3] [4] (左键追加, 右键菜单撤回/清空)
+        # 校准帧标记按钮 [0] [1] [2] (cap=2: 左键追加, 右键菜单撤回/清空)
         self._calib_btns: dict[int, QPushButton] = {}
-        for count in range(5):
+        for count in range(3):
             btn = QPushButton(f"[{count}] 标记背景" if count == 0 else f"[{count}] 标记{count}只")
             btn.setToolTip(f"左键: 将当前帧追加为 {count} 只小鼠样本 | 右键: 撤回/清空")
             btn.setMinimumHeight(30)
@@ -286,27 +355,20 @@ class MainWindow(QMainWindow):
             self._calib_btns[count] = btn
             toolbar.addWidget(btn)
 
-        # 刷新计数
-        self._btn_refresh = QPushButton("刷新计数")
-        self._btn_refresh.setToolTip("强制重新计算小鼠数量 (R)")
-        self._btn_refresh.clicked.connect(self._refresh_counter)
-        self._btn_refresh.setMinimumHeight(30)
-        toolbar.addWidget(self._btn_refresh)
-
         # ROI 操作
         self._btn_clear_roi = QPushButton("X 清除 ROI")
         self._btn_clear_roi.clicked.connect(self._video_widget.clear_roi)
         self._btn_clear_roi.setMinimumHeight(30)
         toolbar.addWidget(self._btn_clear_roi)
 
-        # ROI C 开关 (改进.md 6 节)
-        self._btn_toggle_roi_c = QPushButton("[C] ROI C 开")
-        self._btn_toggle_roi_c.setToolTip("切换 ROI C (计数区域) 显示")
-        self._btn_toggle_roi_c.setCheckable(True)
-        self._btn_toggle_roi_c.setChecked(True)
-        self._btn_toggle_roi_c.clicked.connect(self._on_toggle_roi_c)
-        self._btn_toggle_roi_c.setMinimumHeight(30)
-        toolbar.addWidget(self._btn_toggle_roi_c)
+        # 编辑模式切换: 内圈(Core) / 外圈(Count)
+        self._btn_edit_mode = QPushButton("编辑内圈")
+        self._btn_edit_mode.setToolTip("切换当前编辑的椭圆: 内圈(暖点铜片)/外圈(两只鼠范围)")
+        self._btn_edit_mode.setCheckable(True)
+        self._btn_edit_mode.setChecked(True)  # 默认编辑内圈
+        self._btn_edit_mode.clicked.connect(self._on_toggle_edit_mode)
+        self._btn_edit_mode.setMinimumHeight(30)
+        toolbar.addWidget(self._btn_edit_mode)
 
         # 自动检测
         toolbar.addSeparator()
@@ -319,6 +381,13 @@ class MainWindow(QMainWindow):
         )
         toolbar.addWidget(self._btn_detect)
 
+        # 颜色识别 (对当前选中片段运行耳标颜色识别)
+        self._btn_color = QPushButton("颜色识别")
+        self._btn_color.setToolTip("对当前选中片段运行耳标颜色识别")
+        self._btn_color.clicked.connect(self._on_color_identify)
+        self._btn_color.setMinimumHeight(30)
+        self._btn_color.setEnabled(False)
+        toolbar.addWidget(self._btn_color)
 
 
     # ==================================================================
@@ -451,11 +520,11 @@ class MainWindow(QMainWindow):
         roi_data = self._video_widget.get_roi_data()
         if roi_data is not None:
             crop = self._video_widget.get_roi_a_crop()
-            roi_a = roi_data["roi_a"]
+            roi_core = roi_data["roi_core"]
             occ_ratio = getattr(self, '_last_occ_ratio', 0.0)
             is_occupied = getattr(self, '_last_is_occupied', False)
             dark_ratio = getattr(self, '_last_dark_ratio', 0.0)
-            self._zoom_widget.update_roi_crop(crop, roi_a, is_occupied, occ_ratio, dark_ratio)
+            self._zoom_widget.update_roi_crop(crop, roi_core, is_occupied, occ_ratio, dark_ratio)
 
         # 更新检测指标
         self._recompute_metrics(frame_bgr)
@@ -503,7 +572,7 @@ class MainWindow(QMainWindow):
             self._last_occ_ratio = 0.0
             self._last_dark_ratio = 0.0
         else:
-            metrics = self._metrics_calc.compute(frame_bgr, roi_data["roi_a"], bg)
+            metrics = self._metrics_calc.compute(frame_bgr, roi_data["roi_core"], bg)
             self._last_is_occupied = metrics.get("is_occupied", False)
             self._last_occ_ratio = metrics.get("occlusion_area_ratio", 0.0)
             self._last_dark_ratio = metrics.get("dark_pixel_ratio", 0.0)
@@ -511,16 +580,33 @@ class MainWindow(QMainWindow):
             self._metrics_panel.update_metrics(metrics)
 
         # ---- 计数指标: 无背景时用 dark-only fallback 仍然计算 ----
-        roi_c_scale = roi_data.get("roi_c_scale", 1.6)
         count_data = self._mouse_counter.estimate_count(
-            frame_bgr, roi_data["roi_a"], roi_c_scale, bg,
+            frame_bgr, roi_data["roi_core"], roi_data.get("roi_count"), bg,
         )
         self._metrics_panel.update_count_metrics(count_data)
+
+        # Phase 10: Debug 视图 - 收集中间 mask
+        if self._debug_view_enabled and bg is not None:
+            debug_masks = self._metrics_calc.compute_debug_masks(
+                frame_bgr, roi_data["roi_core"], bg
+            )
+            debug_data = {
+                "masks": debug_masks,
+                "occ_score": metrics.get("occlusion_area_ratio", 0.0) if metrics else 0.0,
+                "count": count_data.get("estimated_mouse_count", 0),
+                "count_confidence": count_data.get("count_confidence", 0.0),
+                "blob_count": count_data.get("blob_count", 0),
+                "dark_pixel_ratio": metrics.get("dark_pixel_ratio", 0.0) if metrics else 0.0,
+                "debug_blobs": count_data.get("debug_blobs", []),
+            }
+            self._video_widget.set_debug_data(debug_data)
+        elif not self._debug_view_enabled:
+            self._video_widget.set_debug_data({})
 
         crop = self._video_widget.get_roi_a_crop()
         if crop is not None:
             self._zoom_widget.update_roi_crop(
-                crop, roi_data["roi_a"], self._last_is_occupied,
+                crop, roi_data["roi_core"], self._last_is_occupied,
                 self._last_occ_ratio, self._last_dark_ratio,
             )
 
@@ -572,9 +658,36 @@ class MainWindow(QMainWindow):
             return
 
         if action_name == "confirm":
-            # 标记确认 → 绿色
-            self._event_list.update_segment_status(event_idx, "confirmed")
-            self._annotation_panel.set_event(event_idx, self._event_list.get_segment(event_idx))
+            # Phase 6: 确认逻辑 — count=1选1个mouse_id, count=2选2个, count=0可标误检
+            est_count = seg.get("estimated_mouse_count")
+            mouse_ids = self._annotation_panel.get_mouse_ids()
+            if est_count == 0:
+                # count=0 → 标记误检
+                self._event_list.update_segment_status(event_idx, "rejected")
+                seg["confirmed_mouse_count"] = 0
+                seg["count_status"] = "rejected"
+                self._event_list._refresh_table()
+                self._annotation_panel.set_event(event_idx, self._event_list.get_segment(event_idx))
+                self._statusbar.showMessage(f"片段 #{seg.get('segment_id')} count=0, 已标记为误检")
+            elif est_count is not None and est_count >= 1 and len(mouse_ids) < est_count:
+                # 小鼠数量不足
+                self._statusbar.showMessage(
+                    f"确认失败: count={est_count} 需要选择 {est_count} 只小鼠, "
+                    f"当前仅选 {len(mouse_ids)} 只"
+                )
+                return
+            else:
+                # 正常确认
+                seg["mouse_ids"] = sorted(mouse_ids)
+                seg["confirmed_mouse_count"] = len(mouse_ids)
+                self._event_list.update_segment_status(event_idx, "confirmed")
+                seg["count_status"] = "confirmed"
+                self._event_list._refresh_table()
+                self._annotation_panel.set_event(event_idx, self._event_list.get_segment(event_idx))
+                self._statusbar.showMessage(
+                    f"片段 #{seg.get('segment_id')} 已确认: "
+                    f"count={len(mouse_ids)}, 小鼠={mouse_ids}"
+                )
             # 跳到下一个 pending
             next_idx = self._event_list.goto_next_pending(event_idx)
             if next_idx >= 0:
@@ -639,6 +752,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先标记0只小鼠帧作为空场背景 (点击 [0] 标记0只)")
             return
 
+        if self._detection_worker is not None and self._detection_worker.isRunning():
+            QMessageBox.warning(self, "检测进行中", "请等待当前检测完成")
+            return
+
         # 禁用按钮
         self._btn_detect.setEnabled(False)
         self._btn_detect.setText("... 检测中...")
@@ -654,12 +771,13 @@ class MainWindow(QMainWindow):
         bg = self._video_widget.get_background()
         video_path = self._video_widget.video_path
 
+        counter_snapshot = self._mouse_counter.clone() if self._mouse_counter else None
         self._detection_worker = DetectionWorkerWithCounting(
             video_path=video_path,
             roi_data=roi_data,
             background_bgr=bg,
             metrics_calc=self._metrics_calc,
-            counter=self._mouse_counter,
+            counter=counter_snapshot,
         )
         self._detection_worker.progress_signal.connect(self._on_detection_progress)
         self._detection_worker.finished_signal.connect(self._on_detection_finished_with_counting)
@@ -681,6 +799,8 @@ class MainWindow(QMainWindow):
         self._btn_detect.setEnabled(True)
         self._btn_detect.setText("自动检测全视频")
         self._progress_bar.setVisible(False)
+
+        # 启用身份辅助按钮
 
         self._episodes = episodes
         self._count_segments = segments
@@ -884,20 +1004,20 @@ class MainWindow(QMainWindow):
             self._video_widget.next_frame()
             return
 
-        # A/D ±10 帧
+        # A/D ±10 帧 -> J/L 快退/进 (Phase 6: 重映射)
         if key == Qt.Key_A:
-            self._video_widget.jump_frames(-10)
-            return
-        if key == Qt.Key_D:
-            self._video_widget.jump_frames(10)
-            return
-
-        # J/L 上下事件
-        if key == Qt.Key_J:
             self._goto_prev_event()
             return
-        if key == Qt.Key_L:
+        if key == Qt.Key_D:
             self._goto_next_event()
+            return
+
+        # J/L 快退/进 (Phase 6: 原 A/D ±10 帧移至此)
+        if key == Qt.Key_J:
+            self._video_widget.jump_frames(-10)
+            return
+        if key == Qt.Key_L:
+            self._video_widget.jump_frames(10)
             return
 
         # Enter: 保存并下一个
@@ -934,7 +1054,7 @@ class MainWindow(QMainWindow):
             self._annotation_panel._on_mouse_toggle(4)
             return
 
-        # Ctrl+1/2/3/4: 确认数量 (改进.md 13 节)
+        # Ctrl+1/2: 确认数量 (改进.md 13 节; cap=2)
         if event.modifiers() == Qt.ControlModifier:
             if key == Qt.Key_1:
                 self._on_count_confirmed(self._current_review_idx, 1)
@@ -942,16 +1062,15 @@ class MainWindow(QMainWindow):
             if key == Qt.Key_2:
                 self._on_count_confirmed(self._current_review_idx, 2)
                 return
-            if key == Qt.Key_3:
-                self._on_count_confirmed(self._current_review_idx, 3)
-                return
-            if key == Qt.Key_4:
-                self._on_count_confirmed(self._current_review_idx, 4)
-                return
 
         # R: 强制刷新计数器
         if key == Qt.Key_R:
             self._refresh_counter()
+            return
+
+        # K: 拆分片段 (Phase 6)
+        if key == Qt.Key_K:
+            self._on_split_at_current_frame()
             return
 
         super().keyPressEvent(event)
@@ -1021,13 +1140,33 @@ class MainWindow(QMainWindow):
         )
 
 
-    def _on_toggle_roi_c(self):
-        """切换 ROI C 显示"""
-        self._video_widget._show_roi_c = self._btn_toggle_roi_c.isChecked()
-        if self._video_widget._show_roi_c:
-            self._btn_toggle_roi_c.setText("[C] ROI C 开")
+
+
+
+
+
+
+
+    def _on_toggle_edit_mode(self):
+        """切换编辑模式: core ↔ count"""
+        if self._btn_edit_mode.isChecked():
+            self._video_widget.set_edit_mode("core")
+            self._btn_edit_mode.setText("编辑内圈")
         else:
-            self._btn_toggle_roi_c.setText("[C] ROI C 关")
+            self._video_widget.set_edit_mode("count")
+            self._btn_edit_mode.setText("编辑外圈")
+
+    def _on_toggle_debug_view(self, checked: bool):
+        """Phase 10: Debug 视图开关"""
+        self._debug_view_enabled = checked
+        if checked:
+            self._statusbar.showMessage("Debug 视图已启用: ROI边框/深色mask/暖色mask/前景mask/连通区/occ/count")
+        else:
+            self._statusbar.showMessage("Debug 视图已关闭")
+            self._video_widget.set_debug_data({})
+        # 立即刷新当前帧
+        if self._video_widget.current_frame_bgr is not None:
+            self._recompute_metrics(self._video_widget.current_frame_bgr)
         self._video_widget.update()
 
     def _on_mark_calibration(self, mouse_count: int):
@@ -1088,8 +1227,8 @@ class MainWindow(QMainWindow):
         bg = self._calib_store.latest_background()
         try:
             count_result = self._mouse_counter.estimate_count(
-                sample.frame_bgr, roi_data["roi_a"],
-                roi_data.get("roi_c_scale", 1.6), bg,
+                sample.frame_bgr, roi_data["roi_core"],
+                roi_data.get("roi_count"), bg,
             )
             area = count_result.get("total_mouse_area", 0)
             sample.measured_area = area
@@ -1105,15 +1244,15 @@ class MainWindow(QMainWindow):
 
     def _remeasure_all_pending_samples(self):
         """遍历所有 not valid 的 1-4 样本, 重新测量"""
-        for count in range(1, 5):
+        for count in range(1, 3):
             for sample in self._calib_store.get_samples(count):
                 if not sample.valid:
                     self._try_measure_sample(sample)
 
     def _rebuild_counter_references(self):
-        """清空 MouseCounter 样本 → 遍历 CalibrationStore 中 valid 样本 → add_count_area_sample"""
+        """清空 MouseCounter 样本 → 遍历 CalibrationStore 中 valid 样本 → add_count_area_sample (cap=2)"""
         self._mouse_counter.clear_all_count_area_samples()
-        for count in range(1, 5):
+        for count in range(1, 3):
             for sample in self._calib_store.get_samples(count):
                 if sample.valid and sample.measured_area is not None and sample.measured_area > 0:
                     self._mouse_counter.add_count_area_sample(count, sample.measured_area)
@@ -1125,7 +1264,7 @@ class MainWindow(QMainWindow):
     def _update_calib_button_labels(self):
         """按钮文字改为 "[N]背景×n" 或 "[N] N只×v/n" 格式, 有样本无背景用黄色"""
         has_bg = self._calib_store.has_background()
-        for count in range(5):
+        for count in range(3):
             n = self._calib_store.count(count)
             btn = self._calib_btns[count]
             if count == 0:
@@ -1230,8 +1369,8 @@ class MainWindow(QMainWindow):
             return
 
         count_data = self._mouse_counter.estimate_count(
-            frame, roi_data["roi_a"],
-            roi_data.get("roi_c_scale", 1.6),
+            frame, roi_data["roi_core"],
+            roi_data.get("roi_count"),
             bg,
         )
         self._metrics_panel.update_count_metrics(count_data)
@@ -1246,17 +1385,147 @@ class MainWindow(QMainWindow):
         )
 
     # ==================================================================
-    # Markdown 统计表导出
+    # 颜色识别
     # ==================================================================
-    def _on_export_markdown(self):
-        """导出 Markdown 统计表"""
-        confirmed = self._event_list.get_confirmed_segments()
-        if not confirmed:
-            QMessageBox.information(self, "提示", "没有已确认的事件, 请先确认事件后再导出。")
+    def _on_color_identify(self):
+        """对当前选中片段运行颜色识别 (后台线程+QProgressDialog)"""
+        seg_idx = self._current_review_idx
+        if seg_idx < 0:
+            QMessageBox.information(self, "提示", "请先在事件列表中选择一个片段")
+            return
+
+        seg = self._event_list.get_segment(seg_idx)
+        if not seg:
+            return
+
+        roi_data = self._video_widget.get_roi_data()
+        if roi_data is None:
+            QMessageBox.warning(self, "提示", "请先绘制 ROI")
+            return
+
+        video_path = self._video_widget.video_path
+        fps = self._video_widget.fps
+        seg_id = seg.get("segment_id", "?")
+
+        progress = QProgressDialog(
+            f"颜色识别: 正在分析片段 #{seg_id}...", "取消", 0, 100, self
+        )
+        progress.setWindowTitle("颜色识别")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        self._color_worker = ColorIdentifyWorker(
+            seg, roi_data["roi_core"], video_path, fps, self
+        )
+        self._color_worker.progress.connect(
+            lambda pct, msg: progress.setLabelText(f"{msg}") or progress.setValue(pct)
+        )
+        self._color_worker.finished.connect(
+            lambda result: self._on_color_finished(progress, seg, result)
+        )
+        self._color_worker.error.connect(
+            lambda err: self._on_color_error(progress, err)
+        )
+        progress.canceled.connect(lambda: self._color_worker.cancel())
+        self._color_worker.start()
+
+    def _on_color_finished(self, progress, seg, result):
+        progress.close()
+        colors = result.get("auto_mouse_colors", [])
+        conf = result.get("identity_confidence", 0)
+        note = result.get("identity_note", "")
+
+        # 过滤掉 unknown
+        valid_colors = [c for c in colors if c != "unknown"]
+
+        if not valid_colors:
+            QMessageBox.information(self, "颜色识别", "未检测到有效耳标颜色。")
+            return
+
+        # 为每种颜色弹窗让用户选择鼠号
+        mouse_ids = []
+        for color in valid_colors:
+            # 用 QInputDialog 获取鼠号 (1-4)
+            mid, ok = QInputDialog.getInt(
+                self, f"识别到 {color}",
+                f"检测到耳标颜色: {color}\n请选择对应的鼠号 (1-4):",
+                value=1, minValue=1, maxValue=4, step=1
+            )
+            if ok:
+                mouse_ids.append(str(mid))
+            else:
+                mouse_ids.append("")  # 取消=未知
+
+        # 应用到segment
+        if mouse_ids:
+            apply_identity_to_segment(seg, result)
+            seg["mouse_ids"] = [int(m) for m in mouse_ids if m]
+            seg["mouse_count"] = len(seg["mouse_ids"])
+            seg["count_status"] = "confirmed"
+
+            # 刷新事件列表显示
+            idx = self._current_review_idx
+            if idx >= 0:
+                self._event_list.update_segment_mouse_ids(idx, seg["mouse_ids"])
+                self._event_list.update_segment_status(idx, "confirmed")
+                self._annotation_panel.set_event(idx, seg)
+
+            self._statusbar.showMessage(
+                f"颜色识别完成: {color} → 鼠{' '.join([str(m) for m in seg['mouse_ids']])} (置信度 {conf:.2f})"
+            )
+
+    def _on_color_error(self, progress, error_msg):
+        progress.close()
+        QMessageBox.critical(self, "颜色识别错误", f"识别失败:\n{error_msg}")
+        self._statusbar.showMessage(f"颜色识别失败: {error_msg}")
+
+    # ==================================================================
+    # 计数刷新 (R键)
+    # ==================================================================
+    def _on_export_csv(self):
+        """导出 CSV (以 CountSegment 为单位)"""
+        segments = self._event_list.get_segments()
+        if not segments:
+            QMessageBox.information(self, "提示", "还没有检测事件, 请先运行自动检测。")
             return
 
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出Markdown统计表", "mouse_occupancy_report.md",
+            self, "导出CSV", "mouse_segments.csv",
+            "CSV 文件 (*.csv);;所有文件 (*.*)"
+        )
+        if not path:
+            return
+
+        try:
+            video_file = self._video_widget.video_path
+            fps = self._video_widget.fps
+            roi_data = self._video_widget.get_roi_data()
+
+            CsvExporter.export_segments(
+                segments=segments,
+                video_file=video_file,
+                fps=fps,
+                output_path=path,
+                roi_data=roi_data,
+            )
+            self._statusbar.showMessage(f"CSV 已导出: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出错误", f"CSV 导出失败:\n{e}")
+            self._statusbar.showMessage(f"CSV 导出失败: {e}")
+
+    # ==================================================================
+    # Markdown 完整视频时间线报表导出
+    # ==================================================================
+    def _on_export_markdown(self):
+        """导出 Markdown 完整视频时间线报表"""
+        segments = self._event_list.get_segments()
+        if not segments:
+            QMessageBox.information(self, "提示", "还没有检测事件, 请先运行自动检测。")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出Markdown时间线报表", "mouse_timeline_report.md",
             "Markdown 文件 (*.md);;所有文件 (*.*)"
         )
         if not path:
@@ -1274,38 +1543,114 @@ class MainWindow(QMainWindow):
                 return f"{h:02d}:{m:02d}:{s:02d}.{ms:02d}"
             return f"{m:02d}:{s:02d}.{ms:02d}"
 
-        # Part A: 事件明细
-        lines = []
-        lines.append("# 小鼠暖点占据统计报告")
-        lines.append("")
-        lines.append("## 事件明细")
-        lines.append("")
-        lines.append("| 编号 | 开始时间 | 结束时间 | 时长(秒) | 小鼠编号 | 数量 |")
-        lines.append("|------|----------|----------|----------|----------|------|")
+        # 状态映射
+        STATUS_MAP = {
+            "pending": "待审核",
+            "confirmed": "已确认",
+            "rejected": "误检",
+            "manual": "人工新增",
+            "modified": "已修改",
+        }
 
-        for seg in confirmed:
+        # 按 start_time 排序
+        sorted_segs = sorted(segments, key=lambda s: s.get("start_time", 0.0))
+
+        # 确定视频总时长: 取 VideoWidget.duration_sec, 未知时用最后片段结束时间
+        video_duration = self._video_widget.duration_sec
+        if video_duration <= 0:
+            video_duration = max(
+                (s.get("end_time", 0.0) for s in sorted_segs), default=0.0
+            )
+
+        # ================================================================
+        # Part A: 完整时间线 (所有时间段全覆盖)
+        # ================================================================
+        lines = []
+        lines.append("# 小鼠暖点占据完整时间线报告")
+        lines.append("")
+        lines.append("## 完整时间线")
+        lines.append("")
+        lines.append("| 编号 | 开始时间 | 结束时间 | 时长(s) | 状态 | 估计数量 | 确认数量 | 小鼠 | 置信度 | 备注 |")
+        lines.append("|------|----------|----------|---------|------|----------|----------|------|--------|------|")
+
+        cursor = 0.0
+        for seg in sorted_segs:
+            st = seg.get("start_time", 0.0)
+            et = seg.get("end_time", 0.0)
+
+            # 前面有空隙 (>0.01s) → 插入未占据行
+            if st - cursor > 0.01:
+                gap_dur = st - cursor
+                lines.append(
+                    f"| -- | {fmt_time(cursor)} | {fmt_time(st)} | {gap_dur:.2f} "
+                    f"| 未占据 | -- | -- | -- | -- | |"
+                )
+
+            # 片段行
             sid = seg.get("segment_id", "--")
-            st = fmt_time(seg.get("start_time", 0.0))
-            et = fmt_time(seg.get("end_time", 0.0))
-            dur = seg.get("duration", 0.0)
+            status_cn = STATUS_MAP.get(seg.get("status", "pending"), seg.get("status", "pending"))
+
+            # 估计数量
+            est_count = seg.get("estimated_mouse_count")
+            est_str = str(est_count) if est_count is not None else "--"
+
+            # 确认数量
+            conf_count = seg.get("confirmed_mouse_count")
+            conf_str = str(conf_count) if conf_count is not None else "--"
+
+            # 小鼠
             mouse_ids = seg.get("mouse_ids", [])
             mouse_str = ",".join(str(m) for m in mouse_ids) if mouse_ids else "--"
-            count = seg.get("confirmed_mouse_count", len(mouse_ids) if mouse_ids else "--")
-            lines.append(f"| {sid} | {st} | {et} | {dur:.2f} | {mouse_str} | {count} |")
+
+            # 置信度
+            confidence = seg.get("count_confidence", 0.0)
+            conf_val_str = f"{confidence:.2f}" if confidence > 0 else "--"
+
+            # 备注
+            remarks = []
+            if confidence > 0 and confidence < 0.5:
+                remarks.append("低置信")
+            if seg.get("modified_by_user"):
+                remarks.append("已修改")
+            note = seg.get("count_note", seg.get("note", ""))
+            if note:
+                remarks.append(str(note))
+            remarks_str = "，".join(remarks)
+
+            dur = seg.get("duration", seg["end_time"] - seg["start_time"])
+
+            lines.append(
+                f"| {sid} | {fmt_time(st)} | {fmt_time(et)} | {dur:.2f} | {status_cn} | "
+                f"{est_str} | {conf_str} | {mouse_str} | {conf_val_str} | {remarks_str} |"
+            )
+
+            cursor = et
+
+        # 结尾空隙
+        if video_duration - cursor > 0.01:
+            gap_dur = video_duration - cursor
+            lines.append(
+                f"| -- | {fmt_time(cursor)} | {fmt_time(video_duration)} | {gap_dur:.2f} "
+                f"| 未占据 | -- | -- | -- | -- | 视频结束 |"
+            )
 
         lines.append("")
 
-        # Part B: 每只小鼠汇总
+        # ================================================================
+        # Part B: 小鼠汇总 (仅 confirmed 状态片段)
+        # ================================================================
+        confirmed = [s for s in sorted_segs if s.get("status") == "confirmed"]
+
         mouse_stats: dict[int, dict] = {}
         for seg in confirmed:
-            dur = seg.get("duration", 0.0)
+            dur = seg.get("duration", seg["end_time"] - seg["start_time"])
             for mid in seg.get("mouse_ids", []):
                 if mid not in mouse_stats:
                     mouse_stats[mid] = {"total_duration": 0.0, "event_count": 0}
                 mouse_stats[mid]["total_duration"] += dur
                 mouse_stats[mid]["event_count"] += 1
 
-        lines.append("## 小鼠汇总")
+        lines.append("## 小鼠汇总 (仅已确认)")
         lines.append("")
         lines.append("| 小鼠编号 | 总占据时长(秒) | 事件次数 |")
         lines.append("|----------|----------------|----------|")
@@ -1318,25 +1663,74 @@ class MainWindow(QMainWindow):
 
         lines.append("")
 
+        # ================================================================
         # Part C: 暖点汇总
-        total_duration = sum(seg.get("duration", 0.0) for seg in confirmed)
-        total_events = len(confirmed)
-        multi_mouse_events = sum(
-            1 for seg in confirmed if len(seg.get("mouse_ids", [])) > 1
+        # ================================================================
+        total_occupied = sum(
+            seg.get("duration", seg["end_time"] - seg["start_time"])
+            for seg in sorted_segs
         )
+        total_unoccupied = video_duration - total_occupied
+        total_events = len(sorted_segs)
+        multi_mouse = sum(1 for seg in sorted_segs if len(seg.get("mouse_ids", [])) > 1)
+        confirmed_count = len(confirmed)
 
         lines.append("## 暖点汇总")
         lines.append("")
-        lines.append("| 暖点编号 | 总被占据时长(秒) | 总事件数 | 多鼠事件数 |")
-        lines.append("|----------|------------------|----------|------------|")
-        lines.append(f"| ROI-1 | {total_duration:.2f} | {total_events} | {multi_mouse_events} |")
+        lines.append("| 指标 | 数值 |")
+        lines.append("|------|------|")
+        lines.append(f"| 视频总时长 | {fmt_time(video_duration)} |")
+        lines.append(f"| 总占据时长 | {total_occupied:.2f}s |")
+        lines.append(f"| 总未占据时长 | {total_unoccupied:.2f}s |")
+        lines.append(f"| 全部事件数 | {total_events} |")
+        lines.append(f"| 已确认事件数 | {confirmed_count} |")
+        lines.append(f"| 多鼠事件数 | {multi_mouse} |")
+        lines.append("")
+
+        # ================================================================
+        # Part D: 校准摘要
+        # ================================================================
+        calib = self._calib_store
+        has_calib = calib is not None and (
+            calib.count(0) > 0
+            or any(calib.count(c) > 0 for c in range(1, 3))
+        )
+
+        lines.append("## 校准摘要")
+        lines.append("")
+
+        if not has_calib:
+            lines.append("未校准")
+        else:
+            lines.append("| 样本类型 | 样本数 | 有效数 | 参考面积 (px²) |")
+            lines.append("|----------|--------|--------|-----------------|")
+            for count in range(3):
+                n = calib.count(count)
+                samples = calib.get_samples(count)
+                v = sum(1 for s in samples if s.valid)
+
+                # 参考面积: 有效样本面积的中位数
+                valid_areas = [
+                    s.measured_area
+                    for s in samples
+                    if s.valid and s.measured_area is not None and s.measured_area > 0
+                ]
+                if valid_areas:
+                    ref_area = sorted(valid_areas)[len(valid_areas) // 2]
+                    area_str = f"{ref_area:.0f}"
+                else:
+                    area_str = "--"
+
+                label = "背景 (0只)" if count == 0 else f"{count} 只小鼠"
+                lines.append(f"| {label} | {n} | {v} | {area_str} |")
+
         lines.append("")
 
         # 写入文件
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
-            self._statusbar.showMessage(f"Markdown 统计表已导出: {path}")
+            self._statusbar.showMessage(f"时间线报表已导出: {path}")
         except Exception as e:
             QMessageBox.critical(self, "导出错误", f"导出失败:\n{e}")
             self._statusbar.showMessage(f"导出失败: {e}")
@@ -1356,11 +1750,11 @@ class MainWindow(QMainWindow):
         self._btn_next.setEnabled(has_video)
         self._btn_clear_roi.setEnabled(has_video)
         self._btn_detect.setEnabled(has_video and has_bg and has_roi)
-        self._btn_toggle_roi_c.setEnabled(has_video)
+        self._btn_color.setEnabled(has_video)
+        self._btn_edit_mode.setEnabled(has_video)
         # 刷新按钮: 无背景也可刷新 (用 fallback)
-        self._btn_refresh.setEnabled(has_video and has_roi)
-        for btn in self._calib_btns.values():
-            btn.setEnabled(has_video)
+        for c, btn in self._calib_btns.items():
+            btn.setEnabled(has_video and c <= 2)  # cap=2: [3]/[4] 永久禁用
         self._time_slider.setEnabled(has_video)
 
     @staticmethod
@@ -1373,7 +1767,3 @@ class MainWindow(QMainWindow):
         s = int(seconds % 60)
         ms = int((seconds - int(seconds)) * 100)
         return f"{h:02d}:{m:02d}:{s:02d}.{ms:02d}"
-
-    @staticmethod
-    def _count_total_pending(events: list) -> int:
-        return sum(1 for e in events if e.get("status") == "pending")

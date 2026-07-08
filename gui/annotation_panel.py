@@ -19,7 +19,7 @@ class AnnotationPanel(QWidget):
     annotation_changed = Signal(int, list)    # event_idx, mouse_ids
     review_action = Signal(str, int)          # action_name, event_idx
     # action_name: "confirm", "reject", "save", "save_next", "clear"
-    count_confirmed = Signal(int, int)        # event_idx, count (1-4)
+    count_confirmed = Signal(int, int)        # event_idx, count (1-2)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -89,21 +89,21 @@ class AnnotationPanel(QWidget):
         # 分隔线
         layout.addWidget(self._sep())
 
-        # ---- 数量确认区 (改进.md 11.3, 13 节) ----
-        lbl_count = QLabel("确认数量 (Ctrl+1~4):")
+        # ---- 数量确认区 (改进.md 11.3, 13 节; cap=2) ----
+        lbl_count = QLabel("确认数量 (Ctrl+1~2):")
         lbl_count.setStyleSheet("color: #aaa; font-size: 10px;")
         layout.addWidget(lbl_count)
 
         count_row = QHBoxLayout()
         self._count_buttons: dict[int, QPushButton] = {}
-        for c in range(1, 5):
+        for c in range(1, 3):
             btn = QPushButton(f"{c} 只")
             btn.setCheckable(False)
             btn.setMinimumHeight(30)
             btn.setFont(QFont("Microsoft YaHei", 10))
             btn.setToolTip(f"确认数量为 {c} 只 (Ctrl+{c})")
             btn.clicked.connect(lambda checked, cnt=c: self._on_count_confirm(cnt))
-            btn.setStyleSheet(self._count_btn_style(c))
+            btn.setStyleSheet(self._count_btn_style())
             self._count_buttons[c] = btn
             count_row.addWidget(btn)
         layout.addLayout(count_row)
@@ -119,6 +119,40 @@ class AnnotationPanel(QWidget):
         # 分隔线
         layout.addWidget(self._sep())
 
+        # ---- 身份识别结果显示区 (颜色识别) ----
+        self._lbl_identity_title = QLabel("颜色识别结果:")
+        self._lbl_identity_title.setStyleSheet("color: #aaa; font-size: 10px;")
+        layout.addWidget(self._lbl_identity_title)
+
+        self._lbl_auto_colors = QLabel("候选颜色: --")
+        self._lbl_auto_colors.setStyleSheet("color: #88ccff; font-size: 11px; font-family: monospace;")
+        layout.addWidget(self._lbl_auto_colors)
+
+        self._lbl_auto_ids = QLabel("自动ID: --")
+        self._lbl_auto_ids.setStyleSheet("color: #88ccff; font-size: 10px; font-family: monospace;")
+        layout.addWidget(self._lbl_auto_ids)
+
+        self._lbl_id_conf = QLabel("识别置信度: --")
+        self._lbl_id_conf.setStyleSheet("color: #aaa; font-size: 10px;")
+        layout.addWidget(self._lbl_id_conf)
+
+        self._lbl_id_method = QLabel("识别方法: --")
+        self._lbl_id_method.setStyleSheet("color: #666; font-size: 9px;")
+        layout.addWidget(self._lbl_id_method)
+
+        self._lbl_id_conflict = QLabel("")
+        self._lbl_id_conflict.setStyleSheet("color: #ff6644; font-size: 11px; font-weight: bold;")
+        self._lbl_id_conflict.setVisible(False)
+        layout.addWidget(self._lbl_id_conflict)
+
+        self._lbl_id_review = QLabel("")
+        self._lbl_id_review.setStyleSheet("color: #ffcc44; font-size: 10px;")
+        self._lbl_id_review.setVisible(False)
+        layout.addWidget(self._lbl_id_review)
+
+        # 分隔线
+        layout.addWidget(self._sep())
+
         # 操作按钮区
         btn_row1 = QHBoxLayout()
 
@@ -130,7 +164,7 @@ class AnnotationPanel(QWidget):
         btn_row1.addWidget(self._btn_clear)
 
         self._btn_save = QPushButton("保存 (S)")
-        self._btn_save.setToolTip("保存当前标注")
+        self._btn_save.setToolTip("保存当前标注 (S 键)")
         self._btn_save.clicked.connect(self._on_save)
         self._btn_save.setMinimumHeight(30)
         self._btn_save.setStyleSheet(self._action_btn_style("#336699"))
@@ -141,7 +175,7 @@ class AnnotationPanel(QWidget):
         btn_row2 = QHBoxLayout()
 
         self._btn_confirm = QPushButton("[v] 确认 (Enter)")
-        self._btn_confirm.setToolTip("标记确认并跳到下一个事件")
+        self._btn_confirm.setToolTip("标记确认并跳到下一个事件 (Enter)")
         self._btn_confirm.clicked.connect(self._on_confirm)
         self._btn_confirm.setMinimumHeight(30)
         self._btn_confirm.setStyleSheet(self._action_btn_style("#338833"))
@@ -189,6 +223,14 @@ class AnnotationPanel(QWidget):
             self._lbl_est_count.setText("估计数量: --")
             self._lbl_count_conf.setText("计数置信度: --")
             self._lbl_count_conf.setStyleSheet("color: #aaa; font-size: 10px;")
+            self._lbl_auto_colors.setText("候选颜色: --")
+            self._lbl_auto_ids.setText("自动ID: --")
+            self._lbl_id_conf.setText("识别置信度: --")
+            self._lbl_id_method.setText("识别方法: --")
+            self._lbl_id_conflict.setText("")
+            self._lbl_id_conflict.setVisible(False)
+            self._lbl_id_review.setText("")
+            self._lbl_id_review.setVisible(False)
             self._set_mouse_ids([])
             for btn in self._count_buttons.values():
                 btn.setEnabled(False)
@@ -232,6 +274,64 @@ class AnnotationPanel(QWidget):
             btn.setEnabled(has_seg)
 
         self._set_mouse_ids(mouse_ids)
+
+        # ---- 身份识别结果显示 ----
+        auto_colors = event_data.get("auto_mouse_colors", [])
+        auto_ids = event_data.get("auto_mouse_ids", [])
+        id_conf = event_data.get("identity_confidence", 0.0)
+        id_method = event_data.get("identity_method", "")
+        id_conflict = event_data.get("identity_conflict", False)
+        id_needs_review = event_data.get("identity_needs_review", False)
+
+        if auto_colors:
+            self._lbl_auto_colors.setText(f"候选颜色: {', '.join(auto_colors)}")
+            if id_conf > 0.6:
+                self._lbl_auto_colors.setStyleSheet("color: #44cc44; font-size: 11px; font-family: monospace;")
+            elif id_conf > 0.3:
+                self._lbl_auto_colors.setStyleSheet("color: #88ccff; font-size: 11px; font-family: monospace;")
+            else:
+                self._lbl_auto_colors.setStyleSheet("color: #ffcc44; font-size: 11px; font-family: monospace;")
+        else:
+            self._lbl_auto_colors.setText("候选颜色: --")
+            self._lbl_auto_colors.setStyleSheet("color: #888; font-size: 11px; font-family: monospace;")
+
+        if auto_ids:
+            self._lbl_auto_ids.setText(f"自动ID: {', '.join(auto_ids)}")
+        else:
+            self._lbl_auto_ids.setText("自动ID: --")
+
+        if id_conf > 0:
+            if id_conf >= 0.7:
+                self._lbl_id_conf.setText(f"识别置信度: {id_conf:.2f} (高)")
+                self._lbl_id_conf.setStyleSheet("color: #44cc44; font-size: 10px;")
+            elif id_conf >= 0.4:
+                self._lbl_id_conf.setText(f"识别置信度: {id_conf:.2f} (中)")
+                self._lbl_id_conf.setStyleSheet("color: #ffcc44; font-size: 10px;")
+            else:
+                self._lbl_id_conf.setText(f"识别置信度: {id_conf:.2f} (低)")
+                self._lbl_id_conf.setStyleSheet("color: #ff6644; font-size: 10px;")
+        else:
+            self._lbl_id_conf.setText("识别置信度: --")
+            self._lbl_id_conf.setStyleSheet("color: #aaa; font-size: 10px;")
+
+        if id_method:
+            self._lbl_id_method.setText(f"识别方法: {id_method}")
+        else:
+            self._lbl_id_method.setText("识别方法: --")
+
+        if id_conflict:
+            self._lbl_id_conflict.setText("[!] 身份冲突 — 存在多种颜色候选")
+            self._lbl_id_conflict.setVisible(True)
+        else:
+            self._lbl_id_conflict.setText("")
+            self._lbl_id_conflict.setVisible(False)
+
+        if id_needs_review:
+            self._lbl_id_review.setText("[!] 建议人工审核")
+            self._lbl_id_review.setVisible(True)
+        else:
+            self._lbl_id_review.setText("")
+            self._lbl_id_review.setVisible(False)
 
     def _set_mouse_ids(self, mouse_ids: list[int]):
         """设置小鼠选择状态"""
@@ -365,7 +465,7 @@ class AnnotationPanel(QWidget):
         """
 
     @staticmethod
-    def _count_btn_style(count: int) -> str:
+    def _count_btn_style() -> str:
         """数量确认按钮样式 (统一暗色)"""
         return """
             QPushButton {

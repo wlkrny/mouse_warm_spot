@@ -10,22 +10,29 @@ import numpy as np
 class DetectionMetrics:
     """单帧遮挡检测指标计算"""
 
-    # 暖点颜色 HSV 范围 (规范定义)
+    # ---- 暖点颜色 HSV 范围 (规范定义) ----
     WARM_H_LOW, WARM_H_HIGH = 10, 30
     WARM_S_LOW, WARM_S_HIGH = 20, 150
     WARM_V_LOW, WARM_V_HIGH = 100, 230
 
-    # 深色像素阈值: V < 80
+    # ---- 深色像素阈值: V < 80 ----
     DARK_V_THRESHOLD = 80
 
-    # 遮挡面积比例权重 (规范 9.2.5)
+    # ---- 遮挡面积比例权重 (规范 9.2.5) ----
     W_WARM = 0.35   # warm_color_ratio 权重
     W_DARK = 0.25   # dark_pixel_ratio 权重
     W_DIFF = 0.25   # background_diff_score 权重
     W_BLOB = 0.15   # largest_dark_blob_area_ratio 权重
 
-    # 判定阈值 (规范)
+    # ---- 判定阈值 (规范) ----
     OCCUPY_THRESHOLD = 0.20
+
+    # ---- Phase 4: 集中阈值管理 ----
+    OCCUPANCY_ENTER_THRESHOLD: float = 0.20   # 进入占据阈值
+    OCCUPANCY_EXIT_THRESHOLD: float = 0.08    # 离开占据阈值
+    CONFIRM_ON_FRAMES: int = 4                # 确认进入所需连续帧数
+    CONFIRM_OFF_FRAMES: int = 10              # 确认离开所需连续帧数
+    OCCUPANCY_NEAR_THRESHOLD_MARGIN: float = 0.05  # 长期贴近阈值的判定边界
 
     def __init__(self):
         """初始化检测指标计算器"""
@@ -285,10 +292,57 @@ class DetectionMetrics:
             "largest_dark_area": largest_area,
         }
 
+    def compute_debug_masks(
+        self,
+        frame_bgr: np.ndarray,
+        roi_a_params: dict,
+        background_frame_bgr: np.ndarray = None,
+    ) -> dict | None:
+        """
+        Phase 10: 返回调试可视化所需的所有中间 mask
+
+        :return: dict with keys:
+            dark_mask, warm_mask, foreground_mask (counting_mask 等效),
+            ellipse_mask (ROI A), roi_crop region info
+        """
+        cx = roi_a_params["cx"]
+        cy = roi_a_params["cy"]
+        a = roi_a_params["a"]
+        b = roi_a_params["b"]
+        angle = roi_a_params.get("angle", 0.0)
+
+        bg_bgr = background_frame_bgr if background_frame_bgr is not None else self._background_bgr
+        if bg_bgr is None:
+            return None
+
+        crop, x1, y1, x2, y2 = self._crop_roi_a(frame_bgr, cx, cy, a, b)
+        if crop is None:
+            return None
+
+        crop_h, crop_w = crop.shape[:2]
+        ellipse_mask = self.create_ellipse_mask_on_crop(crop_h, crop_w, a, b, angle)
+
+        crop_hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        dark_mask = self.dark_pixel_mask(crop_hsv)
+        dark_mask = cv2.bitwise_and(dark_mask, dark_mask, mask=ellipse_mask)
+
+        warm_mask = self.warm_pixel_mask(crop_hsv)
+        warm_mask = cv2.bitwise_and(warm_mask, warm_mask, mask=ellipse_mask)
+
+        return {
+            "dark_mask": dark_mask,
+            "warm_mask": warm_mask,
+            "ellipse_mask": ellipse_mask,
+            "crop_rect": (x1, y1, x2, y2),
+            "crop": crop,
+        }
+
     @staticmethod
     def _empty_result(reason: str = "") -> dict:
         """返回空结果 (未计算)"""
         return {
+            "error": True,
+            "computed": False,
             "warm_color_ratio": 0.0,
             "dark_pixel_ratio": 0.0,
             "background_diff_score": 0.0,

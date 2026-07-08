@@ -51,11 +51,11 @@ class VideoWidget(QWidget):
         self._play_timer.timeout.connect(self._on_play_tick)
 
         # ---- ROI 数据 ----
-        # ROI A: {cx, cy, a, b, angle}  椭圆参数 (相对于视频原始坐标)
-        self.roi_a: dict | None = None
-        self.buffer_roi_scale: float = 1.8  # ROI B 外扩倍数
-        self.roi_c_scale: float = 1.6       # ROI C 外扩倍数 (用于计数, 改进.md 6 节)
-        self._show_roi_c: bool = True       # ROI C 显示开关
+        # ROI Core: {cx, cy, a, b, angle}  暖点铜片精确范围 (内圈, 绿实线)
+        self.roi_core: dict | None = None
+        # ROI Count: {cx, cy, a, b, angle}  两只鼠范围 (外圈, 蓝虚线, 默认=Core×1.8)
+        self.roi_count: dict | None = None
+        self._edit_mode: str = "core"       # "core" | "count"  当前编辑哪个椭圆
 
         # ---- ROI 绘制状态 ----
         self._roi_mode = self.MODE_NONE
@@ -78,6 +78,9 @@ class VideoWidget(QWidget):
         self._loop_start_frame: int = -1     # 循环开始帧 (-1 = 未激活)
         self._loop_end_frame: int = -1       # 循环结束帧 (-1 = 未激活)
         self._loop_active: bool = False
+
+        # ---- Phase 10: Debug 视图数据 ----
+        self._debug_data: dict = {}
 
     # ==================================================================
     # 视频文件操作
@@ -258,34 +261,38 @@ class VideoWidget(QWidget):
     # ROI 操作
     # ==================================================================
     def has_roi(self) -> bool:
-        return self.roi_a is not None
+        return self.roi_core is not None
+
+    def set_edit_mode(self, mode: str):
+        """切换当前编辑的椭圆: "core" 或 "count" """
+        if mode in ("core", "count"):
+            self._edit_mode = mode
+            self.update()
 
     def get_roi_data(self) -> dict | None:
-        """获取 ROI A 数据; 同时附带 ROI B 和 ROI C"""
-        if self.roi_a is None:
+        """获取 ROI 数据: roi_core + roi_count"""
+        if self.roi_core is None:
             return None
         return {
-            "roi_a": dict(self.roi_a),
-            "buffer_roi_scale": self.buffer_roi_scale,
-            "roi_c_scale": self.roi_c_scale,
+            "roi_core": dict(self.roi_core),
+            "roi_count": dict(self.roi_count) if self.roi_count else None,
         }
 
     def clear_roi(self):
         """删除 ROI"""
-        self.roi_a = None
+        self.roi_core = None
+        self.roi_count = None
         self.roi_changed.emit(None)
         self.update()
 
     def save_roi(self, path: str):
-        """保存 ROI 坐标为 JSON"""
-        roi_data = self.get_roi_data()
-        if roi_data is None:
+        """保存 ROI 坐标为 JSON (同时保存 core + count)"""
+        if self.roi_core is None:
             QMessageBox.warning(self, "提示", "未设置 ROI，请先绘制暖点核心 ROI")
             return
         data = {
-            "roi_a": roi_data["roi_a"],
-            "buffer_roi_scale": self.buffer_roi_scale,
-            "roi_c_scale": self.roi_c_scale,
+            "roi_core": dict(self.roi_core),
+            "roi_count": dict(self.roi_count) if self.roi_count else None,
             "video_path": self._video_path,
             "frame_width": self._frame_w,
             "frame_height": self._frame_h,
@@ -294,19 +301,42 @@ class VideoWidget(QWidget):
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def load_roi(self, path: str) -> bool:
-        """加载 ROI 坐标 JSON"""
+        """加载 ROI 坐标 JSON (向后兼容旧格式)"""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self.roi_a = data["roi_a"]
-            self.buffer_roi_scale = data.get("buffer_roi_scale", 1.8)
-            self.roi_c_scale = data.get("roi_c_scale", 1.6)
-            self.roi_changed.emit(self.roi_a)
+            # 新格式: roi_core + roi_count
+            if "roi_core" in data:
+                self.roi_core = data["roi_core"]
+                if data.get("roi_count"):
+                    self.roi_count = data["roi_count"]
+                else:
+                    # roi_count 缺失 → 默认 = core × 1.8
+                    self.roi_count = self._scale_ellipse(self.roi_core, 1.8)
+            # 向后兼容旧格式: roi_a → roi_core, 自动生成 roi_count = roi_a × 2.0
+            elif "roi_a" in data:
+                self.roi_core = data["roi_a"]
+                old_scale = data.get("roi_c_scale", 2.0)
+                self.roi_count = self._scale_ellipse(self.roi_core, old_scale)
+            else:
+                raise ValueError("ROI文件中未找到 roi_core 或 roi_a 字段")
+            self.roi_changed.emit(self.roi_core)
             self.update()
             return True
         except Exception as e:
             QMessageBox.warning(self, "错误", f"加载 ROI 文件失败:\n{e}")
             return False
+
+    @staticmethod
+    def _scale_ellipse(ellipse: dict, scale: float) -> dict:
+        """按倍率缩放椭圆 (保持中心和角度不变)"""
+        return {
+            "cx": ellipse["cx"],
+            "cy": ellipse["cy"],
+            "a": ellipse["a"] * scale,
+            "b": ellipse["b"] * scale,
+            "angle": ellipse.get("angle", 0.0),
+        }
 
     # ==================================================================
     # 坐标转换: widget 坐标 ↔ 视频原始坐标
@@ -367,12 +397,15 @@ class VideoWidget(QWidget):
         painter.drawImage(target_rect, qimg)
 
         # 绘制 ROI
-        if self.roi_a is not None:
+        if self.roi_core is not None:
             self._draw_roi(painter, offset_x, offset_y)
 
         # 绘制检测状态叠加 (规范 6.2 第15项)
-        if self.roi_a is not None:
+        if self.roi_core is not None:
             self._draw_detection_status(painter, offset_x, offset_y)
+
+        # Phase 10: Debug 视图叠加
+        self._draw_debug_overlays(painter, offset_x, offset_y)
 
         # 绘制正在拖拽的 ROI
         if self._roi_mode == self.MODE_DRAWING and self._drawing_roi_rect is not None:
@@ -382,50 +415,42 @@ class VideoWidget(QWidget):
             painter.drawRect(self._drawing_roi_rect)
 
     def _draw_roi(self, painter: QPainter, offset_x: float, offset_y: float):
-        """在视频帧上叠加 ROI A, ROI B 和 ROI C"""
-        cx, cy, a, b = self.roi_a["cx"], self.roi_a["cy"], self.roi_a["a"], self.roi_a["b"]
-        angle = self.roi_a.get("angle", 0.0)
+        """在视频帧上叠加 ROI Core (绿实线) 和 ROI Count (蓝虚线)"""
+        font = QFont("Microsoft YaHei", 9)
+        painter.setFont(font)
 
-        # 转换到 widget 坐标
+        # ---- ROI Count (外圈, 蓝虚线) ----
+        if self.roi_count is not None:
+            cx, cy = self.roi_count["cx"], self.roi_count["cy"]
+            a, b = self.roi_count["a"], self.roi_count["b"]
+            wcx = cx * self._scale + offset_x
+            wcy = cy * self._scale + offset_y
+            wa = a * self._scale
+            wb = b * self._scale
+
+            pen_count = QPen(QColor(80, 160, 255), 1.5, Qt.DashLine)
+            painter.setPen(pen_count)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPointF(wcx, wcy), int(wa), int(wb))
+
+            painter.setPen(QColor(80, 160, 255))
+            painter.drawText(QPointF(wcx - wa, wcy - wb - 4), "ROI Count")
+
+        # ---- ROI Core (内圈, 绿实线, 编辑中时加粗) ----
+        cx, cy, a, b = self.roi_core["cx"], self.roi_core["cy"], self.roi_core["a"], self.roi_core["b"]
         wcx = cx * self._scale + offset_x
         wcy = cy * self._scale + offset_y
         wa = a * self._scale
         wb = b * self._scale
 
-        # ROI C (蓝色虚线, 计数用, 改进.md 6 节) - 可通过开关控制
-        if self._show_roi_c:
-            pen_c = QPen(QColor(80, 160, 255), 1.5, Qt.DashLine)
-            painter.setPen(pen_c)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawEllipse(QPointF(wcx, wcy), int(wa * self.roi_c_scale), int(wb * self.roi_c_scale))
-
-        # ROI B (黄色虚线)
-        pen_b = QPen(QColor(255, 255, 0), 2, Qt.DashLine)
-        painter.setPen(pen_b)
-        painter.setBrush(Qt.NoBrush)
-        painter.drawEllipse(QPointF(wcx, wcy), int(wa * self.buffer_roi_scale), int(wb * self.buffer_roi_scale))
-
-        # ROI A (绿色实线)
-        pen_a = QPen(QColor(0, 255, 0), 2.5, Qt.SolidLine)
-        painter.setPen(pen_a)
+        core_width = 3.5 if self._edit_mode == "core" else 2.5
+        pen_core = QPen(QColor(0, 255, 0), core_width, Qt.SolidLine)
+        painter.setPen(pen_core)
         painter.drawEllipse(QPointF(wcx, wcy), int(wa), int(wb))
 
-        # 标签文字
-        font = QFont("Microsoft YaHei", 9)
-        painter.setFont(font)
-        if self._show_roi_c:
-            painter.setPen(QColor(80, 160, 255))
-            painter.drawText(
-                QPointF(wcx - wa * self.roi_c_scale, wcy - wb * self.roi_c_scale - 4),
-                "ROI C",
-            )
-        painter.setPen(QColor(255, 255, 0))
-        painter.drawText(
-            QPointF(wcx - wa * self.buffer_roi_scale, wcy - wb * self.buffer_roi_scale - 4),
-            "ROI B",
-        )
         painter.setPen(QColor(0, 255, 0))
-        painter.drawText(QPointF(wcx - wa, wcy - wb - 4), "ROI A")
+        edit_hint = " [编辑中]" if self._edit_mode == "core" else ""
+        painter.drawText(QPointF(wcx - wa, wcy - wb - 4), f"ROI Core{edit_hint}")
 
     def _draw_detection_status(self, painter: QPainter, offset_x: float, offset_y: float):
         """在视频帧右上角叠加检测状态文字 (规范 6.2 第15项)"""
@@ -479,8 +504,18 @@ class VideoWidget(QWidget):
                 cy = (vy1 + vy2) / 2.0
                 a = abs(vx2 - vx1) / 2.0   # 半长轴
                 b = abs(vy2 - vy1) / 2.0   # 半短轴
-                self.roi_a = {"cx": cx, "cy": cy, "a": a, "b": b, "angle": 0.0}
-                self.roi_changed.emit(self.roi_a)
+                new_ellipse = {"cx": cx, "cy": cy, "a": a, "b": b, "angle": 0.0}
+
+                if self._edit_mode == "core":
+                    self.roi_core = new_ellipse
+                    # 首次绘制 core 时, 自动生成 count = core × 1.8
+                    if self.roi_count is None:
+                        self.roi_count = self._scale_ellipse(new_ellipse, 1.8)
+                    self.roi_changed.emit(self.roi_core)
+                else:
+                    # edit_mode == "count"
+                    self.roi_count = new_ellipse
+                    self.roi_changed.emit(self.roi_core)
             self._drawing_roi_rect = None
             self._roi_start = None
             self._roi_current = None
@@ -504,10 +539,10 @@ class VideoWidget(QWidget):
             self.next_frame()
         elif key == Qt.Key_Left:
             self.prev_frame()
-        elif key == Qt.Key_D:
-            self.jump_frames(10)    # 前进 10 帧
-        elif key == Qt.Key_A:
-            self.jump_frames(-10)   # 后退 10 帧
+        elif key == Qt.Key_L:
+            self.jump_frames(10)    # 快进 10 帧 (Phase 6)
+        elif key == Qt.Key_J:
+            self.jump_frames(-10)   # 快退 10 帧 (Phase 6)
         else:
             super().keyPressEvent(event)
 
@@ -549,11 +584,11 @@ class VideoWidget(QWidget):
         return self._playing
 
     def get_roi_a_crop(self) -> np.ndarray | None:
-        """获取当前帧 ROI A 裁剪区域 (用于放大窗口)"""
-        if self._current_frame_bgr is None or self.roi_a is None:
+        """获取当前帧 ROI Core 裁剪区域 (用于放大窗口)"""
+        if self._current_frame_bgr is None or self.roi_core is None:
             return None
-        cx, cy = self.roi_a["cx"], self.roi_a["cy"]
-        a, b = self.roi_a["a"], self.roi_a["b"]
+        cx, cy = self.roi_core["cx"], self.roi_core["cy"]
+        a, b = self.roi_core["a"], self.roi_core["b"]
         x1 = max(0, int(cx - a))
         y1 = max(0, int(cy - b))
         x2 = min(self._frame_w, int(cx + a))
@@ -563,10 +598,10 @@ class VideoWidget(QWidget):
         return self._current_frame_bgr[y1:y2, x1:x2].copy()
 
     def get_roi_a_size(self) -> tuple[int, int] | None:
-        """获取 ROI A 裁剪区域尺寸"""
-        if self.roi_a is None:
+        """获取 ROI Core 裁剪区域尺寸"""
+        if self.roi_core is None:
             return None
-        a, b = self.roi_a["a"], self.roi_a["b"]
+        a, b = self.roi_core["a"], self.roi_core["b"]
         return int(a * 2), int(b * 2)
 
     # ==================================================================
@@ -599,3 +634,93 @@ class VideoWidget(QWidget):
     @property
     def loop_end_frame(self) -> int:
         return self._loop_end_frame
+
+    # ==================================================================
+    # Phase 10: Debug 视图
+    # ==================================================================
+    def set_debug_data(self, data: dict):
+        """设置 debug overlay 数据, 空 dict 清除"""
+        self._debug_data = data
+        self.update()
+
+    def _draw_debug_overlays(self, painter: QPainter, offset_x: float, offset_y: float):
+        """Phase 10: 绘制 debug 视图 (mask, 连通区, occ_score, count)"""
+        if not self._debug_data or self._current_frame_bgr is None:
+            return
+
+        masks = self._debug_data.get("masks")
+        if masks is None:
+            return
+
+        crop_rect = masks.get("crop_rect")
+        if crop_rect is None:
+            return
+        x1, y1, x2, y2 = crop_rect
+
+        # 将 crop 坐标转换到 widget 坐标
+        wx1 = x1 * self._scale + offset_x
+        wy1 = y1 * self._scale + offset_y
+        wx2 = x2 * self._scale + offset_x
+        wy2 = y2 * self._scale + offset_y
+        crop_w = int(wx2 - wx1)
+        crop_h = int(wy2 - wy1)
+
+        if crop_w <= 0 or crop_h <= 0:
+            return
+
+        # 绘制 dark mask 叠加 (红色半透明)
+        dark_mask = masks.get("dark_mask")
+        if dark_mask is not None and dark_mask.shape[0] > 0:
+            dark_scaled = cv2.resize(dark_mask.astype(np.uint8), (crop_w, crop_h))
+            dark_rgba = np.zeros((crop_h, crop_w, 4), dtype=np.uint8)
+            dark_rgba[dark_scaled > 0] = [200, 50, 50, 80]
+            qimg = QImage(dark_rgba.data, crop_w, crop_h, crop_w * 4,
+                          QImage.Format_RGBA8888)
+            painter.drawImage(QPointF(wx1, wy1), qimg)
+
+        # 绘制 warm mask 叠加 (橙色)
+        warm_mask = masks.get("warm_mask")
+        if warm_mask is not None and warm_mask.shape[0] > 0:
+            warm_scaled = cv2.resize(warm_mask.astype(np.uint8), (crop_w, crop_h))
+            warm_rgba = np.zeros((crop_h, crop_w, 4), dtype=np.uint8)
+            warm_rgba[warm_scaled > 0] = [255, 165, 0, 60]
+            qimg = QImage(warm_rgba.data, crop_w, crop_h, crop_w * 4,
+                          QImage.Format_RGBA8888)
+            painter.drawImage(QPointF(wx1, wy1), qimg)
+
+        # 绘制连通区边框 (blob bboxes)
+        debug_blobs = self._debug_data.get("debug_blobs", [])
+        if debug_blobs:
+            pen = QPen(QColor(255, 255, 0), 2, Qt.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            for blob in debug_blobs:
+                bbox = blob.get("bbox", [0, 0, 10, 10])
+                bx = wx1 + bbox[0] * self._scale
+                by = wy1 + bbox[1] * self._scale
+                bw = bbox[2] * self._scale
+                bh = bbox[3] * self._scale
+                painter.drawRect(int(bx), int(by), int(bw), int(bh))
+
+        # 绘制 ROI A crop 边框
+        pen = QPen(QColor(0, 128, 255), 2, Qt.DotLine)
+        painter.setPen(pen)
+        painter.drawRect(int(wx1), int(wy1), crop_w, crop_h)
+
+        # 显示 occ_score 和 count 文字
+        occ_score = self._debug_data.get("occ_score", 0.0)
+        count = self._debug_data.get("count", 0)
+        count_conf = self._debug_data.get("count_confidence", 0.0)
+        dark_ratio = self._debug_data.get("dark_pixel_ratio", 0.0)
+        blob_count = self._debug_data.get("blob_count", 0)
+
+        font = QFont("Monospace", 10, QFont.Bold)
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255))
+
+        text_x = int(wx1 + 5)
+        text_y = int(wy2 + 15)
+        line_h = 16
+        painter.drawText(text_x, text_y, f"OCC:{occ_score:.3f} Dark:{dark_ratio:.3f}")
+        painter.drawText(text_x, text_y + line_h,
+                         f"Count:{count} Conf:{count_conf:.2f} Blobs:{blob_count}")

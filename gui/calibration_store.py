@@ -23,12 +23,14 @@ class CalibrationStore:
     """多帧校准样本存储, 管理 0-4 只小鼠的标记样本"""
 
     def __init__(self):
-        self.samples: dict[int, list[CalibrationSample]] = {
-            0: [], 1: [], 2: [], 3: [], 4: [],
-        }
+        self.samples: dict[int, list[CalibrationSample]] = {0:[], 1:[], 2:[]}
 
     def add_sample(self, sample: CalibrationSample):
         """追加一个样本"""
+        if sample.frame_bgr is not None:
+            sample.frame_bgr = sample.frame_bgr.copy()
+        if sample.mouse_count not in self.samples:
+            self.samples[sample.mouse_count] = []
         self.samples[sample.mouse_count].append(sample)
 
     def remove_last_sample(self, mouse_count: int) -> CalibrationSample | None:
