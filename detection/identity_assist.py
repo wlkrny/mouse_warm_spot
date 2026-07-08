@@ -7,6 +7,7 @@
 import cv2
 import numpy as np
 import logging
+import math
 from collections import defaultdict
 from collections.abc import Callable
 
@@ -18,9 +19,6 @@ class IdentityAssist:
 
     # Ear tag pixel conditions
     EAR_V_MIN = 80
-    EAR_S_MIN = 30
-    WARM_H_LOW = 10
-    WARM_H_HIGH = 30
 
     # Blob filter
     EAR_AREA_MIN = 3
@@ -90,19 +88,22 @@ class IdentityAssist:
     @staticmethod
     def classify_color(h: float, s: float, v: float) -> str:
         """Classify pixel color from HSV values.
-        Returns: 'red' | 'blue' | 'green' | 'white' | 'unknown'
+        Returns: 'red' | 'yellow' | 'blue' | 'green' | 'white' | 'unknown'
         """
-        # red: H<10 or H>170, S>50
-        if (h < 10 or h > 170) and s > 50:
+        # red: H≤12 or H≥165, S>45 (tightened S from 50→45)
+        if (h <= 12 or h >= 165) and s > 45:
             return "red"
-        # blue: 90≤H≤140, S>35
-        if 90 <= h <= 140 and s > 35:
+        # yellow: 13≤H≤42, S>45 (NEW — OpenCV HSV yellow ~13-42)
+        if 13 <= h <= 42 and s > 45:
+            return "yellow"
+        # blue: 90≤H≤135, S>50 (tightened: H 140→135, S 35→50)
+        if 90 <= h <= 135 and s > 50:
             return "blue"
-        # green: 40≤H≤80, S>35
-        if 40 <= h <= 80 and s > 35:
+        # green: 48≤H≤80, S>50 (tightened: H 40→48, S 35→50)
+        if 48 <= h <= 80 and s > 50:
             return "green"
-        # white: S<30, V>180
-        if s < 30 and v > 180:
+        # white: S<35, V>170 (relaxed: S 30→35, V 180→170)
+        if s < 35 and v > 170:
             return "white"
         return "unknown"
 
@@ -110,58 +111,75 @@ class IdentityAssist:
     # Contour-level color classification (pixel voting)
     # ------------------------------------------------------------------
     @staticmethod
-    def _classify_contour(px: np.ndarray) -> tuple[str, bool]:
+    def _classify_contour(px: np.ndarray) -> tuple[str, bool, float]:
         """
-        逐像素颜色投票，返回多数颜色。
+        逐像素颜色投票，返回多数颜色，加入主色优势判断。
         解决色相循环均值崩塌导致的红色→蓝色误判。
-        
+
         :param px: (N,3) HSV像素数组
-        :return: (color, is_low_confidence)
-                 color: 'red'|'blue'|'green'|'white'|'unknown'
+        :return: (color, is_low_confidence, best_ratio)
+                 color: 'red'|'yellow'|'blue'|'green'|'white'|'unknown'
                  is_low_confidence: True if secondary (relaxed) thresholds were used
+                 best_ratio: 主色占比 (0.0 if unknown)
         """
         if len(px) == 0:
-            return "unknown", True
-        
+            return "unknown", True, 0.0
+
         h = px[:, 0]
         s = px[:, 1]
         v = px[:, 2]
-        
-        # Primary vote: standard thresholds (same as classify_color)
-        red_mask   = ((h < 10) | (h > 170)) & (s > 50)
-        blue_mask  = (h >= 90) & (h <= 140) & (s > 35)
-        green_mask = (h >= 40) & (h <= 80) & (s > 35)
-        white_mask = (s < 30) & (v > 180)
-        
+
+        total_px = len(px)
+
+        # Primary vote: tightened thresholds (same as classify_color)
+        red_mask    = ((h <= 12) | (h >= 165)) & (s > 45)
+        yellow_mask = (h >= 13) & (h <= 42) & (s > 45)
+        green_mask  = (h >= 48) & (h <= 80) & (s > 50)
+        blue_mask   = (h >= 90) & (h <= 135) & (s > 50)
+        white_mask  = (s < 35) & (v > 170)
+
         counts = {
-            "red":   int(np.sum(red_mask)),
-            "blue":  int(np.sum(blue_mask)),
-            "green": int(np.sum(green_mask)),
-            "white": int(np.sum(white_mask)),
+            "red":    int(np.sum(red_mask)),
+            "yellow": int(np.sum(yellow_mask)),
+            "blue":   int(np.sum(blue_mask)),
+            "green":  int(np.sum(green_mask)),
+            "white":  int(np.sum(white_mask)),
         }
-        
+
         best_color = max(counts, key=counts.get)
-        if counts[best_color] > 0:
-            return best_color, False
-        
+        best_count = counts[best_color]
+        if best_count > 0:
+            best_ratio = best_count / max(1, total_px)
+            # Dominance gate: min_pixels≥3, ratio≥0.35, margin≥0.15
+            if best_count >= 3 and best_ratio >= 0.35:
+                sorted_counts = sorted(counts.values(), reverse=True)
+                second_best = sorted_counts[1] if len(sorted_counts) > 1 else 0
+                second_ratio = second_best / max(1, total_px)
+                if best_ratio - second_ratio >= 0.15:
+                    return best_color, False, best_ratio
+
         # Secondary fallback: relaxed thresholds for low-confidence detection
-        red_mask2   = ((h < 10) | (h > 170)) & (s > 35)
-        blue_mask2  = (h >= 85) & (h <= 145) & (s > 25)
-        green_mask2 = (h >= 35) & (h <= 85) & (s > 25)
-        white_mask2 = (s < 40) & (v > 160)
-        
+        red_mask2    = ((h <= 12) | (h >= 165)) & (s > 35)
+        yellow_mask2 = (h >= 10) & (h <= 45) & (s > 35)
+        green_mask2  = (h >= 43) & (h <= 88) & (s > 35)
+        blue_mask2   = (h >= 85) & (h <= 140) & (s > 35)
+        white_mask2  = (s < 40) & (v > 160)
+
         counts2 = {
-            "red":   int(np.sum(red_mask2)),
-            "blue":  int(np.sum(blue_mask2)),
-            "green": int(np.sum(green_mask2)),
-            "white": int(np.sum(white_mask2)),
+            "red":    int(np.sum(red_mask2)),
+            "yellow": int(np.sum(yellow_mask2)),
+            "blue":   int(np.sum(blue_mask2)),
+            "green":  int(np.sum(green_mask2)),
+            "white":  int(np.sum(white_mask2)),
         }
-        
+
         best_color2 = max(counts2, key=counts2.get)
-        if counts2[best_color2] > 0:
-            return best_color2, True
-        
-        return "unknown", True
+        best_count2 = counts2[best_color2]
+        if best_count2 > 0:
+            best_ratio2 = best_count2 / max(1, total_px)
+            return best_color2, True, best_ratio2
+
+        return "unknown", True, 0.0
 
     # ------------------------------------------------------------------
     # Main detection
@@ -268,8 +286,8 @@ class IdentityAssist:
             _, mouse_mask = cv2.threshold(hsv[:, :, 2], self.EAR_V_MIN - 1, 255, cv2.THRESH_BINARY_INV)
             mouse_mask = cv2.bitwise_and(mouse_mask, mouse_mask, mask=search_ellipse)
 
-            # Ear-tag pixel mask (V>80, S>30, H∉[10,30])
-            ep_mask = self._ear_tag_pixel_mask(hsv)
+            # Ear-tag pixel mask: color union (red|yellow|green|blue|white)
+            ep_mask = self._build_tag_candidate_mask(hsv)
             ep_mask = cv2.bitwise_and(ep_mask, ep_mask, mask=annular)
 
             # Connected components
@@ -291,7 +309,7 @@ class IdentityAssist:
                 if len(px) == 0:
                     continue
 
-                color, low_conf = self._classify_contour(px)
+                color, low_conf, best_ratio = self._classify_contour(px)
                 if color == "unknown":
                     continue
 
@@ -308,23 +326,59 @@ class IdentityAssist:
                 if low_conf:
                     hit_conf *= 0.5  # Penalize secondary-threshold classifications
 
+                # Blue/green quality penalty: avg S <55 or ratio <0.45 → 50% reduction
+                if color in ("blue", "green"):
+                    avg_s = float(np.mean(px[:, 1]))
+                    if avg_s < 55:
+                        hit_conf *= 0.5
+                    if best_ratio < 0.45:
+                        hit_conf *= 0.5
+
                 color_hits[color]["hit_count"] += 1
                 color_hits[color]["frames"].append(frame_idx)
                 color_hits[color]["confs"].append(hit_conf)
                 color_hits[color]["areas"].append(area)
 
         # ---- Aggregate per-color confidence ----
+        total_search = max(1, len(search_frames))
         for color in color_hits:
             h = color_hits[color]
-            base = 0.5
-            if color in ("red", "blue", "green"):
-                base += 0.2
-            if 3 <= np.mean(h["areas"]) <= 300 if h["areas"] else False:
-                base += 0.1
-            if h["hit_count"] >= 3:
-                base += 0.1
+
+            # 唯一帧覆盖率 (时间持久性)
+            unique_frames = len(set(h["frames"]))
+            frame_ratio = unique_frames / total_search
+
+            # 每命中平均质量
             avg_hc = np.mean(h["confs"]) if h["confs"] else 0.0
-            h["confidence"] = min(0.95, base + avg_hc * 0.5)
+
+            score = 0.0
+
+            # (1) 基础分: 0.35
+            score += 0.35
+
+            # (2) 已知颜色加成: 0.15
+            if color in ("red", "yellow", "blue", "green"):
+                score += 0.15
+
+            # (3) 面积质量: 0.08
+            if h["areas"]:
+                area_mean = np.mean(h["areas"])
+                if 3 <= area_mean <= 300:
+                    score += 0.08
+
+            # (4) 时间持久性: 最多 +0.30, 按 frame_ratio 线性缩放
+            score += 0.30 * frame_ratio
+
+            # (5) 命中数量 (对数尺度): 最多 +0.22
+            #     log10(3)≈0.48, log10(1302)≈3.11; ×0.07 → 0.034~0.218
+            hit_log = math.log10(max(1, h["hit_count"]))
+            score += min(0.22, hit_log * 0.07)
+
+            # (6) 每命中质量: 最多 +0.12 (avg_hc max ~0.4 × 0.3)
+            score += 0.30 * avg_hc
+
+            # Cap 从 0.95 提升至 0.99
+            h["confidence"] = round(min(0.99, score), 4)
 
         # 日志: 汇总每种颜色的命中
         for color in sorted(color_hits.keys()):
@@ -338,7 +392,15 @@ class IdentityAssist:
             target_count = 1
         target_count = min(target_count, 2)  # cap=2
 
-        colors = sorted(color_hits.keys(), key=lambda c: color_hits[c]["confidence"], reverse=True)
+        colors = sorted(
+            color_hits.keys(),
+            key=lambda c: (
+                color_hits[c]["confidence"],          # primary: confidence
+                color_hits[c]["hit_count"],           # tiebreaker 1: 命中总数
+                len(set(color_hits[c]["frames"])),    # tiebreaker 2: 唯一帧数
+            ),
+            reverse=True,
+        )
         found_count = len(colors)
 
         logger.info(f"冲突处理: target={target_count} found={found_count} colors={colors}")
@@ -358,7 +420,7 @@ class IdentityAssist:
             identity_confidence = 0.3
             identity_method += "|no_detection"
             note = "未检测到任何耳标颜色"
-            logger.warning(f"未检测到耳标颜色! 扫描了{total_search}帧, 环形区域像素条件: V>{self.EAR_V_MIN} S>{self.EAR_S_MIN} H∉[{self.WARM_H_LOW},{self.WARM_H_HIGH}] area={self.EAR_AREA_MIN}-{self.EAR_AREA_MAX}, 需靠近mouse_mask≤{self.MOUSE_PROXIMITY_PX}px")
+            logger.warning(f"未检测到耳标颜色! 扫描了{total_search}帧, 像素条件: 颜色联合筛选(red|yellow|green|blue|white) area={self.EAR_AREA_MIN}-{self.EAR_AREA_MAX}, 需靠近mouse_mask≤{self.MOUSE_PROXIMITY_PX}px")
 
         elif found_count == target_count:
             auto_mouse_colors = colors[:]
@@ -378,13 +440,31 @@ class IdentityAssist:
 
         else:  # found_count > target_count
             top = colors[:target_count]
+            dropped = colors[target_count:]
             auto_mouse_colors = top
             auto_mouse_ids = [f"auto_{c}" for c in top]
             identity_needs_review = True
             identity_conflict = True
             identity_confidence = float(np.mean([color_hits[c]["confidence"] for c in top]))
             identity_method += "|conflict"
-            note = f"检测到{found_count}种颜色({','.join(colors)}), 取top{target_count}"
+            note = (f"检测到{found_count}种颜色({','.join(colors)}), "
+                    f"选中={top}, 丢弃={dropped}")
+            # 丢弃颜色显著命中数时增强警告
+            sig_dropped = [
+                dc for dc in dropped
+                if color_hits[dc]["hit_count"] > max(total_search * 0.15, 30)
+            ]
+            if sig_dropped:
+                note += (
+                    f"; ⚠ 丢弃颜色命中数显著: "
+                    + ", ".join(f"{c}({color_hits[c]['hit_count']}hits)" for c in sig_dropped)
+                )
+            logger.warning(
+                f"颜色冲突解决: 检测到{found_count}种颜色, "
+                f"选中 {top} (conf={[color_hits[c]['confidence'] for c in top]}), "
+                f"丢弃 {dropped} (conf={[color_hits[c]['confidence'] for c in dropped]}), "
+                f"显著丢弃={sig_dropped if sig_dropped else '无'}"
+            )
 
         # ---- Phase 8: A→B swap detection ----
         if target_count == 1 and found_count >= 2:
@@ -415,17 +495,28 @@ class IdentityAssist:
         return m
 
     @classmethod
-    def _ear_tag_pixel_mask(cls, hsv: np.ndarray) -> np.ndarray:
-        """V>80, S>30, H∉[10,30]"""
-        v = hsv[:, :, 2]
-        s = hsv[:, :, 1]
-        h = hsv[:, :, 0]
+    def _build_tag_candidate_mask(cls, hsv: np.ndarray) -> np.ndarray:
+        """Color union pixel mask: any pixel matching at least one color's H+S+V condition.
 
-        v_ok = v > cls.EAR_V_MIN
-        s_ok = s > cls.EAR_S_MIN
-        h_ok = (h < cls.WARM_H_LOW) | (h > cls.WARM_H_HIGH)
+        Colors (vectorized):
+          red:    (H≤12 or H≥165) AND S>45 AND V>50
+          yellow: 13≤H≤42 AND S>45 AND V>70
+          green:  48≤H≤80 AND S>50 AND V>50
+          blue:   90≤H≤135 AND S>50 AND V>50
+          white:  S<35 AND V>170
+        """
+        v = hsv[:, :, 2].astype(np.float32)
+        s = hsv[:, :, 1].astype(np.float32)
+        h = hsv[:, :, 0].astype(np.float32)
 
-        return (v_ok & s_ok & h_ok).astype(np.uint8) * 255
+        red_mask    = ((h <= 12) | (h >= 165)) & (s > 45) & (v > 50)
+        yellow_mask = (h >= 13) & (h <= 42) & (s > 45) & (v > 70)
+        green_mask  = (h >= 48) & (h <= 80) & (s > 50) & (v > 50)
+        blue_mask   = (h >= 90) & (h <= 135) & (s > 50) & (v > 50)
+        white_mask  = (s < 35) & (v > 170)
+
+        union = red_mask | yellow_mask | green_mask | blue_mask | white_mask
+        return union.astype(np.uint8) * 255
 
     @classmethod
     def _contour_near_mask(cls, cnt, mouse_mask: np.ndarray) -> bool:
@@ -460,7 +551,7 @@ class IdentityAssist:
     def _hit_conf_part(color: str, area: float, inner: bool) -> float:
         """Per-blob confidence sub-score (0–0.4)."""
         s = 0.0
-        if color in ("red", "blue", "green"):
+        if color in ("red", "yellow", "blue", "green"):
             s += 0.2
         if 10 <= area <= 300:
             s += 0.1
