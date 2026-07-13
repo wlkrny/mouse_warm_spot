@@ -544,7 +544,7 @@ class VideoWidget(QWidget):
         elif key == Qt.Key_J:
             self.jump_frames(-10)   # 快退 10 帧 (Phase 6)
         else:
-            super().keyPressEvent(event)
+            event.ignore()  # 未处理的键传播到 MainWindow
 
     # ==================================================================
     # 辅助属性

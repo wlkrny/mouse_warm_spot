@@ -90,20 +90,22 @@ class AnnotationPanel(QWidget):
         layout.addWidget(self._sep())
 
         # ---- 数量确认区 (改进.md 11.3, 13 节; cap=2) ----
-        lbl_count = QLabel("确认数量 (Shift+1~2):")
+        lbl_count = QLabel("确认数量 (Shift+0~2):")
         lbl_count.setStyleSheet("color: #aaa; font-size: 10px;")
         layout.addWidget(lbl_count)
 
         count_row = QHBoxLayout()
         self._count_buttons: dict[int, QPushButton] = {}
-        for c in range(1, 3):
-            btn = QPushButton(f"{c} 只")
-            btn.setCheckable(False)
+        for c in range(0, 3):
+            label = f"{c} 只"
+            shortcut = f"Shift+{c}"
+            btn = QPushButton(label)
+            btn.setCheckable(True)
             btn.setMinimumHeight(30)
             btn.setFont(QFont("Microsoft YaHei", 10))
-            btn.setToolTip(f"确认数量为 {c} 只 (Shift+{c})")
+            btn.setToolTip(f"确认数量为 {c} 只 ({shortcut})")
             btn.clicked.connect(lambda checked, cnt=c: self._on_count_confirm(cnt))
-            btn.setStyleSheet(self._count_btn_style())
+            btn.setStyleSheet(self._count_btn_style(c, False))
             self._count_buttons[c] = btn
             count_row.addWidget(btn)
         layout.addLayout(count_row)
@@ -156,7 +158,7 @@ class AnnotationPanel(QWidget):
         # 操作按钮区
         btn_row1 = QHBoxLayout()
 
-        self._btn_clear = QPushButton("清空 (C)")
+        self._btn_clear = QPushButton("清空")
         self._btn_clear.setToolTip("清空当前小鼠标注")
         self._btn_clear.clicked.connect(self._on_clear)
         self._btn_clear.setMinimumHeight(30)
@@ -232,8 +234,7 @@ class AnnotationPanel(QWidget):
             self._lbl_id_review.setText("")
             self._lbl_id_review.setVisible(False)
             self._set_mouse_ids([])
-            for btn in self._count_buttons.values():
-                btn.setEnabled(False)
+            self._reset_count_buttons()
             return
 
         seg_id = event_data.get("segment_id", "--")
@@ -268,10 +269,18 @@ class AnnotationPanel(QWidget):
             self._lbl_count_conf.setText("计数置信度: --")
             self._lbl_count_conf.setStyleSheet("color: #aaa; font-size: 10px;")
 
-        # 按钮启用状态
+        # 按钮启用状态 + 同步确认数量选中态
         has_seg = event_idx >= 0
-        for btn in self._count_buttons.values():
+        confirmed_count = event_data.get("confirmed_mouse_count")
+        for c in range(0, 3):
+            btn = self._count_buttons[c]
             btn.setEnabled(has_seg)
+            if confirmed_count is not None and c == confirmed_count:
+                btn.setChecked(True)
+                btn.setStyleSheet(self._count_btn_style(c, True))
+            else:
+                btn.setChecked(False)
+                btn.setStyleSheet(self._count_btn_style(c, False))
 
         self._set_mouse_ids(mouse_ids)
 
@@ -356,6 +365,14 @@ class AnnotationPanel(QWidget):
             self._lbl_mouse.setText("小鼠: --")
             self._lbl_mouse.setStyleSheet("color: #aaa; font-size: 12px;")
 
+    def _reset_count_buttons(self):
+        """重置数量确认按钮为未选中/禁用状态"""
+        for c in range(0, 3):
+            btn = self._count_buttons[c]
+            btn.setChecked(False)
+            btn.setEnabled(c <= 2)  # cap=2 时 0/1/2 均可启用
+            btn.setStyleSheet(self._count_btn_style(c, False))
+
     def get_mouse_ids(self) -> list[int]:
         """获取当前小鼠标注"""
         return list(self._mouse_ids)
@@ -414,9 +431,19 @@ class AnnotationPanel(QWidget):
             self.review_action.emit("reject", self._current_event_idx)
 
     def _on_count_confirm(self, count: int):
-        """确认数量 (Shift+1~2) (改进.md 11.3 节)"""
-        if self._current_event_idx >= 0:
-            self.count_confirmed.emit(self._current_event_idx, count)
+        """确认数量 (Shift+0~2) — 点击切换, 互斥选中 (改进.md 11.3 节)"""
+        if self._current_event_idx < 0:
+            return
+        # 互斥逻辑: 点击后保持常驻颜色, 取消其他按钮选中
+        for c in range(0, 3):
+            btn = self._count_buttons[c]
+            if c == count:
+                btn.setChecked(True)
+                btn.setStyleSheet(self._count_btn_style(c, True))
+            else:
+                btn.setChecked(False)
+                btn.setStyleSheet(self._count_btn_style(c, False))
+        self.count_confirmed.emit(self._current_event_idx, count)
 
     # ------------------------------------------------------------------
     # 样式
@@ -469,20 +496,32 @@ class AnnotationPanel(QWidget):
         """
 
     @staticmethod
-    def _count_btn_style() -> str:
-        """数量确认按钮样式 (统一暗色)"""
-        return """
-            QPushButton {
-                background-color: #3a3a3a; color: #ccc;
-                border: 1px solid #555; border-radius: 3px;
-                padding: 4px 12px; font-size: 12px;
-            }
-            QPushButton:checked {
-                background-color: #555; color: #fff;
-                border: 1px solid #888;
-            }
-            QPushButton:hover { background-color: #4a4a4a; }
-        """
+    def _count_btn_style(count: int, checked: bool) -> str:
+        """数量确认按钮样式 — 与小鼠按钮一致, 选中后常驻颜色, 0/1/2 各自独立颜色"""
+        # count 0/1/2 用小鼠标注风格但互斥
+        colors = {
+            0: "#888888",  # 灰 (0只 = 误检, 不再用红色)
+            1: "#4488cc",  # 蓝
+            2: "#44aa66",  # 绿
+        }
+        c = colors.get(count, "#888")
+        if checked:
+            return f"""
+                QPushButton {{
+                    background-color: {c}; color: #fff;
+                    border: 2px solid #fff; border-radius: 3px;
+                    padding: 4px 12px; font-size: 12px; font-weight: bold;
+                }}
+            """
+        else:
+            return f"""
+                QPushButton {{
+                    background-color: #3a3a3a; color: #ccc;
+                    border: 1px solid #555; border-radius: 3px;
+                    padding: 4px 12px; font-size: 12px;
+                }}
+                QPushButton:hover {{ background-color: {c}; color: #fff; }}
+            """
 
     @staticmethod
     def _fmt_time(seconds: float) -> str:

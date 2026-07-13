@@ -4,7 +4,7 @@
 显示自动检测生成的事件, 支持点击跳转、右键菜单、颜色标记状态
 """
 
-from PySide6.QtCore import Qt, Signal, QPoint
+from PySide6.QtCore import QEvent, Qt, Signal, QPoint
 from PySide6.QtGui import QColor, QBrush, QFont, QAction
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
@@ -90,6 +90,9 @@ class EventListWidget(QWidget):
         self._table.setAlternatingRowColors(True)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_context_menu)
+        # QTableWidget 会在内部消费按键；通过事件过滤器将非导航快捷键
+        # 交给 MainWindow，确保选中事件列表后 C / Shift+数字等仍然有效。
+        self._table.installEventFilter(self)
 
         # 表头自适应
         header = self._table.horizontalHeader()
@@ -132,9 +135,9 @@ class EventListWidget(QWidget):
             }
         """)
 
-        # 信号连接
+        # 信号连接 — 使用 currentCellChanged 统一处理鼠标点击和键盘上下箭头导航
         self._table.itemDoubleClicked.connect(self._on_double_click)
-        self._table.itemClicked.connect(self._on_click)
+        self._table.currentCellChanged.connect(self._on_current_cell_changed)
 
         layout.addWidget(self._table)
 
@@ -390,18 +393,17 @@ class EventListWidget(QWidget):
     # 交互
     # ------------------------------------------------------------------
     def _on_double_click(self, item: QTableWidgetItem):
-        """双击跳转到事件"""
+        """双击跳转到事件 (兼容保留)"""
         row = item.row()
         if 0 <= row < len(self._segments):
             self._table.selectRow(row)
             self.segment_selected.emit(row)
 
-    def _on_click(self, item: QTableWidgetItem):
-        """单击跳转到事件"""
-        row = item.row()
-        if 0 <= row < len(self._segments):
-            self._table.selectRow(row)
-            self.segment_selected.emit(row)
+    def _on_current_cell_changed(self, currentRow: int, currentColumn: int,
+                                  previousRow: int, previousColumn: int):
+        """当前行变化时触发 — 统一处理鼠标点击和键盘上下箭头导航"""
+        if currentRow >= 0 and currentRow < len(self._segments) and currentRow != previousRow:
+            self.segment_selected.emit(currentRow)
 
     def select_row(self, index: int):
         """选中指定行"""
@@ -438,6 +440,28 @@ class EventListWidget(QWidget):
         if current_idx < len(self._segments) - 1:
             return current_idx + 1
         return current_idx
+
+    # ------------------------------------------------------------------
+    # 键盘事件 — 传播快捷键到主窗口
+    # ------------------------------------------------------------------
+    def eventFilter(self, watched, event):
+        """让事件列表获得焦点时，主窗口快捷键仍可用。
+
+        ``QTableWidget`` 会在自己的事件处理阶段消费字母和数字键，单靠
+        EventListWidget.keyPressEvent() 无法收到这些事件。仅保留表格导航键
+        给表格本身，其余按键直接交由顶层 MainWindow 处理。
+        """
+        if watched is self._table and event.type() == QEvent.KeyPress:
+            navigation_keys = {
+                Qt.Key_Up, Qt.Key_Down, Qt.Key_PageUp, Qt.Key_PageDown,
+                Qt.Key_Home, Qt.Key_End,
+            }
+            if event.key() not in navigation_keys:
+                window = self.window()
+                if window is not self:
+                    window.keyPressEvent(event)
+                    return True
+        return super().eventFilter(watched, event)
 
     # ------------------------------------------------------------------
     # 右键菜单

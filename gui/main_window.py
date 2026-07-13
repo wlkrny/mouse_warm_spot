@@ -1244,14 +1244,27 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "加载错误", f"项目加载失败:\n{e}")
 
     def _on_slider_changed(self, value: int):
-        """滑块拖动"""
+        """滑块拖动 — 拖出循环范围时自动清除循环, 允许自由导航"""
         if self._video_widget._cap is not None:
+            # 如果拖到了循环范围之外, 清除循环限制
+            if self._video_widget.loop_active:
+                loop_start = self._video_widget.loop_start_frame
+                loop_end = self._video_widget.loop_end_frame
+                if value < loop_start or value > loop_end:
+                    self._video_widget.clear_loop()
             self._video_widget.jump_to_frame(value)
 
     def _on_slider_released(self):
         """滑块释放"""
         value = self._time_slider.value()
-        self._video_widget.jump_to_frame(value)
+        if self._video_widget._cap is not None:
+            # 同样检查循环范围
+            if self._video_widget.loop_active:
+                loop_start = self._video_widget.loop_start_frame
+                loop_end = self._video_widget.loop_end_frame
+                if value < loop_start or value > loop_end:
+                    self._video_widget.clear_loop()
+            self._video_widget.jump_to_frame(value)
 
     # ==================================================================
     # 键盘事件 — 快捷键映射 (规范 7 节)
@@ -1299,9 +1312,14 @@ class MainWindow(QMainWindow):
             self._on_review_action("reject", self._current_review_idx)
             return
 
-        # C: 清空选择
+        # C: 拆分片段 (在当前帧切割)
         if key == Qt.Key_C:
-            self._annotation_panel._on_clear()
+            self._on_split_at_current_frame()
+            return
+
+        # K: 拆分片段 (兼容保留)
+        if key == Qt.Key_K:
+            self._on_split_at_current_frame()
             return
 
         # S: 保存
@@ -1309,7 +1327,19 @@ class MainWindow(QMainWindow):
             self._on_review_action("save", self._current_review_idx)
             return
 
-        # 1/2/3/4: 小鼠切换
+        # Shift+0/1/2: 确认数量 (改进.md 13 节; cap=2) — 必须在 1-4 之前检测
+        if event.modifiers() & Qt.ShiftModifier:
+            if key == Qt.Key_0:
+                self._on_count_confirmed(self._current_review_idx, 0)
+                return
+            if key == Qt.Key_1:
+                self._on_count_confirmed(self._current_review_idx, 1)
+                return
+            if key == Qt.Key_2:
+                self._on_count_confirmed(self._current_review_idx, 2)
+                return
+
+        # 1/2/3/4: 小鼠切换 (未按Shift时)
         if key == Qt.Key_1:
             self._annotation_panel._on_mouse_toggle(1)
             return
@@ -1323,23 +1353,9 @@ class MainWindow(QMainWindow):
             self._annotation_panel._on_mouse_toggle(4)
             return
 
-        # Shift+1/2: 确认数量 (改进.md 13 节; cap=2)
-        if event.modifiers() == Qt.ShiftModifier:
-            if key == Qt.Key_1:
-                self._on_count_confirmed(self._current_review_idx, 1)
-                return
-            if key == Qt.Key_2:
-                self._on_count_confirmed(self._current_review_idx, 2)
-                return
-
         # R: 强制刷新计数器
         if key == Qt.Key_R:
             self._refresh_counter()
-            return
-
-        # K: 拆分片段 (Phase 6)
-        if key == Qt.Key_K:
-            self._on_split_at_current_frame()
             return
 
         super().keyPressEvent(event)
@@ -1367,15 +1383,22 @@ class MainWindow(QMainWindow):
     # ==================================================================
     @Slot(int, int)
     def _on_count_confirmed(self, event_idx: int, count: int):
-        """确认数量 (Shift+1~2)"""
+        """确认数量 (Shift+0~2)"""
         seg = self._event_list.get_segment(event_idx)
         if seg is None:
             return
         seg["confirmed_mouse_count"] = count
-        seg["count_status"] = "confirmed"
-        self._event_list._refresh_table()
+        if count == 0:
+            seg["count_status"] = "rejected"
+            seg["status"] = "rejected"
+        else:
+            seg["count_status"] = "confirmed"
+        self._event_list._update_row(event_idx)
         self._annotation_panel.set_event(event_idx, self._event_list.get_segment(event_idx))
-        self._statusbar.showMessage(f"片段 #{seg.get('segment_id')} 数量确认: {count} 只")
+        if count == 0:
+            self._statusbar.showMessage(f"片段 #{seg.get('segment_id')} 已标记为误检 (0 只)")
+        else:
+            self._statusbar.showMessage(f"片段 #{seg.get('segment_id')} 数量确认: {count} 只")
 
     @Slot(int, int)
     def _on_segment_split_requested(self, idx: int, frame: int):
