@@ -233,7 +233,7 @@ class VisionProvider(ABC):
         ...
 
     @abstractmethod
-    def classify_frames(self, frames: list[np.ndarray]) -> tuple[str, float, str, dict | None]:
+    def classify_frames(self, frames: list[np.ndarray], clip_id: str | None = None) -> tuple[str, float, str, dict | None]:
         """多帧上下文颜色分类（每个 segment 一次调用，携带大范围上下文 crops）。
 
         :param frames: (H,W,3) uint8 BGR 图像列表，按时间顺序排列
@@ -242,9 +242,9 @@ class VisionProvider(ABC):
         """
         ...
 
-    def classify_segment_frames(self, frames: list[np.ndarray]) -> dict:
+    def classify_segment_frames(self, frames: list[np.ndarray], clip_id: str | None = None) -> dict:
         """Backward-compatible segment API for count and ordered colors."""
-        color, confidence, method, raw = self.classify_frames(frames)
+        color, confidence, method, raw = self.classify_frames(frames, clip_id=clip_id)
         return {"mouse_count": 1, "colors": [color], "confidence": confidence,
                 "method": method, "raw_response": raw,
                 "parse_status": "legacy_adapter"}
@@ -367,7 +367,7 @@ class _OpenAICompatVisionProvider(VisionProvider):
         # 解析响应
         return self._parse_response(resp_json)
 
-    def classify_frames(self, frames: list[np.ndarray]) -> tuple[str, float, str, dict | None]:
+    def classify_frames(self, frames: list[np.ndarray], clip_id: str | None = None) -> tuple[str, float, str, dict | None]:
         """多帧上下文颜色分类（每个 segment 一次调用）。
 
         :param frames: (H,W,3) uint8 BGR 图像列表，按时间顺序排列
@@ -412,12 +412,12 @@ class _OpenAICompatVisionProvider(VisionProvider):
         resp_json = self._post_json(endpoint, headers, payload)
 
         # 排错：保存多帧 context 输入和 API 原始返回
-        self._save_debug_multi(frames, resp_json)
+        self._save_debug_multi(frames, resp_json, clip_id=clip_id)
 
         result = self.classify_segment_frames_from_response(resp_json)
         return result["colors"][0], result["confidence"], result["method"], resp_json
 
-    def classify_segment_frames(self, frames: list[np.ndarray]) -> dict:
+    def classify_segment_frames(self, frames: list[np.ndarray], clip_id: str | None = None) -> dict:
         """Classify one segment and return validated count/colors metadata."""
         if not self._configured:
             raise VisionProviderError("Provider 未正确配置；缺少 API 密钥或端点。", provider=self._method_name)
@@ -437,7 +437,7 @@ class _OpenAICompatVisionProvider(VisionProvider):
         endpoint = f"{self._api_base.rstrip('/')}/chat/completions"
         logger.info("%s -> POST %s model=%s frames=%d segment_count_call", self._method_name, endpoint, self._model, len(data_uris))
         resp_json = self._post_json(endpoint, self._build_headers(), self._build_multi_payload(data_uris, len(frames)))
-        self._save_debug_multi(frames, resp_json)
+        self._save_debug_multi(frames, resp_json, clip_id=clip_id)
         return self.classify_segment_frames_from_response(resp_json)
 
     def classify_segment_frames_from_response(self, resp_json: dict) -> dict:
@@ -689,8 +689,8 @@ class _OpenAICompatVisionProvider(VisionProvider):
     # ------------------------------------------------------------------
     _debug_counter: int = 0
 
-    def _save_debug(self, patch_bgr: np.ndarray, resp_json: dict):
-        """MOUSE_COLOR_AI_SAVE_DEBUG=1 时，保存 patch 图片和 response JSON 到 debug_vision_output/"""
+    def _save_debug(self, patch_bgr: np.ndarray, resp_json: dict, clip_id: str | None = None):
+        """MOUSE_COLOR_AI_SAVE_DEBUG=1 时保存 patch/response；可选 clip 子目录。"""
         if os.environ.get("MOUSE_COLOR_AI_SAVE_DEBUG", "").strip() not in ("1", "true", "yes", "on"):
             return
         try:
@@ -707,7 +707,7 @@ class _OpenAICompatVisionProvider(VisionProvider):
         except Exception as exc:
             logger.debug("debug save failed: %s", exc)
 
-    def _save_debug_multi(self, frames: list[np.ndarray], resp_json: dict):
+    def _save_debug_multi(self, frames: list[np.ndarray], resp_json: dict, clip_id: str | None = None):
         """MOUSE_COLOR_AI_SAVE_DEBUG=1 时，保存多帧 context crops 和 response JSON。
 
         注意：不保存 Authorization header/API key，不保存 base64 payload。
@@ -717,6 +717,8 @@ class _OpenAICompatVisionProvider(VisionProvider):
             return
         try:
             out_dir = Path.cwd() / "debug_vision_output"
+            if clip_id:
+                out_dir /= str(clip_id)
             out_dir.mkdir(parents=True, exist_ok=True)
             idx = _OpenAICompatVisionProvider._debug_counter
             _OpenAICompatVisionProvider._debug_counter += 1
@@ -732,6 +734,7 @@ class _OpenAICompatVisionProvider(VisionProvider):
             content = (choices[0].get("message", {}).get("content") or "").strip() if choices else ""
             parsed_segment = _parse_segment_json(content)
             manifest = {
+                "clip_id": clip_id,
                 "num_context_crops": len(frames),
                 "ai_mouse_count": parsed_segment.get("mouse_count") if parsed_segment else None,
                 "ai_colors": parsed_segment.get("colors") if parsed_segment else None,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 
 DEFAULT_BATCH_CONCURRENCY = 2
@@ -31,6 +32,9 @@ def batch_summary(results: list[dict], failures: int, cancelled: bool) -> dict:
     """Summarize completed outcomes; cancellation is reported, not fabricated."""
     thermometer = sum(bool(result.get("thermometer_present")) for result in results)
     review = sum(bool(result.get("identity_needs_review")) for result in results)
+    total_cost_usd = math.fsum(
+        _safe_cost_usd(result.get("ai_api_cost_usd", 0.0)) for result in results
+    )
     return {
         "total_completed": len(results),
         "success": sum(not result.get("identity_needs_review", False)
@@ -39,4 +43,16 @@ def batch_summary(results: list[dict], failures: int, cancelled: bool) -> dict:
         "needs_review": review,
         "failed": failures,
         "cancelled": cancelled,
+        "total_cost_usd": total_cost_usd,
     }
+
+
+def _safe_cost_usd(value) -> float:
+    """Return a finite numeric USD cost; malformed worker output costs zero."""
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0.0
+        value = float(value)
+        return value if value >= 0.0 and math.isfinite(value) else 0.0
+    except (TypeError, ValueError):
+        return 0.0

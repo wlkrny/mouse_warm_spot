@@ -2,10 +2,12 @@
 
 import json
 
+import pytest
+
 from detection.batch_color import (DEFAULT_BATCH_CONCURRENCY, batch_color_concurrency,
                                    batch_items, batch_summary)
 from detection.color_mouse_mapping import ColorMouseMappingStore
-from detection.identity_assist import apply_identity_to_segment
+from detection.identity_assist import IdentityAssist, apply_identity_to_segment
 
 
 def _result(colors, **extra):
@@ -63,7 +65,28 @@ def test_batch_config_scope_and_summary(monkeypatch):
                 {"start_frame": 2, "end_frame": 3, "estimated_mouse_count": 0},
                 {"start_frame": 4, "end_frame": 3, "estimated_mouse_count": 1}]
     assert [index for index, _ in batch_items(segments)] == [0]
-    summary = batch_summary([_result(["green"]), _result(["red"], thermometer_present=True,
-                                                     identity_needs_review=True)], 1, True)
-    assert summary == {"total_completed": 2, "success": 1, "thermometer": 1,
-                       "needs_review": 1, "failed": 1, "cancelled": True}
+    summary = batch_summary([
+        _result(["green"], ai_api_cost_usd=.0012),
+        _result(["red"], thermometer_present=True, identity_needs_review=True,
+                ai_api_cost_usd=.0003),
+    ], 1, True)
+    assert {key: value for key, value in summary.items() if key != "total_cost_usd"} == {
+        "total_completed": 2, "success": 1, "thermometer": 1,
+        "needs_review": 1, "failed": 1, "cancelled": True,
+    }
+    assert summary["total_cost_usd"] == pytest.approx(.0015)
+
+
+def test_extract_ai_api_cost_usd_is_safe_for_malformed_responses():
+    assert IdentityAssist._extract_ai_api_cost_usd({"usage": {"cost": .0012}}) == .0012
+    assert IdentityAssist._extract_ai_api_cost_usd(None) == 0.0
+    assert IdentityAssist._extract_ai_api_cost_usd({"usage": {"cost": "0.0012"}}) == 0.0
+
+
+def test_batch_summary_ignores_invalid_costs():
+    summary = batch_summary([
+        _result(["green"], ai_api_cost_usd=".002"),
+        _result(["red"], ai_api_cost_usd=float("nan")),
+        _result(["blue"], ai_api_cost_usd=-.001),
+    ], 0, False)
+    assert summary["total_cost_usd"] == 0.0

@@ -1715,13 +1715,17 @@ class MainWindow(QMainWindow):
         if result.get("thermometer_present"):
             self._apply_color_result(index, result)
             QMessageBox.warning(self, "颜色识别", "检测到测温器/探头，颜色识别置信度已置零，请人工复核。")
-            self._statusbar.showMessage(f"颜色识别完成: 事件 #{seg.get('segment_id')}，置信度 0.00")
+            self._statusbar.showMessage(
+                f"颜色识别完成: 事件 #{seg.get('segment_id')}，置信度 0.00"
+                f"，API费用 ${result.get('ai_api_cost_usd', 0.0):.4f}"
+            )
             return
         updated = self._apply_color_result(index, result)
         assigned = updated.get("mouse_ids", []) if updated else []
         suffix = f"，自动分配小鼠 {assigned}" if assigned else "，需人工复核"
         self._statusbar.showMessage(
             f"颜色识别完成: 事件 #{seg.get('segment_id')}，置信度 {result.get('identity_confidence', 0):.2f}{suffix}"
+            f"，API费用 ${result.get('ai_api_cost_usd', 0.0):.4f}"
         )
 
     def _start_batch_color_identify(self, roi_data):
@@ -1768,7 +1772,8 @@ class MainWindow(QMainWindow):
         summary = batch_summary(self._batch_color_results, self._batch_color_failures, cancelled)
         message = (f"总数: {len(self._batch_color_worker._items)}\n成功: {summary['success']}\n"
                    f"测温器干扰: {summary['thermometer']}\n需复核: {summary['needs_review']}\n"
-                   f"失败: {summary['failed']}\n取消: {'是' if cancelled else '否'}\n\n"
+                   f"失败: {summary['failed']}\n取消: {'是' if cancelled else '否'}\n"
+                   f"API 总费用: ${summary['total_cost_usd']:.4f}\n\n"
                    f"颜色→鼠号映射: {self._color_mapping_store.summary()}")
         QMessageBox.information(self, "颜色识别批处理汇总", message)
         self._statusbar.showMessage("全部事件颜色识别已取消；已完成结果已保留。" if cancelled else "全部事件颜色识别完成。")

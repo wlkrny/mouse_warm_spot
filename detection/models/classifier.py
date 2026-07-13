@@ -325,7 +325,7 @@ class EarTagClassifier:
         color = self._rule_classify(hsv_pixels)
         return color, "ear_tag_color_rule"
 
-    def classify_segment_frames(self, frames: list) -> dict:
+    def classify_segment_frames(self, frames: list, clip_id: str | None = None) -> dict:
         """Return segment-level VLM count/colors without invoking local fallback.
 
         Invalid, unavailable, or low-confidence responses are represented as an
@@ -338,7 +338,14 @@ class EarTagClassifier:
         if self._vision_provider is None:
             return fallback
         try:
-            result = self._vision_provider.classify_segment_frames(frames)
+            if clip_id is None:
+                result = self._vision_provider.classify_segment_frames(frames)
+            else:
+                try:
+                    result = self._vision_provider.classify_segment_frames(frames, clip_id=clip_id)
+                except TypeError:
+                    # Third-party providers with the pre-clip signature remain usable.
+                    result = self._vision_provider.classify_segment_frames(frames)
             if not isinstance(result, dict):
                 raise ValueError("non-dict segment response")
             count, colors, confidence = result.get("mouse_count"), result.get("colors"), result.get("confidence")
@@ -352,7 +359,13 @@ class EarTagClassifier:
         except (AttributeError, ValueError, TypeError):
             # Providers predating the new API retain the old one-color protocol.
             try:
-                color, confidence, method, raw = self._vision_provider.classify_frames(frames)
+                if clip_id is None:
+                    color, confidence, method, raw = self._vision_provider.classify_frames(frames)
+                else:
+                    try:
+                        color, confidence, method, raw = self._vision_provider.classify_frames(frames, clip_id=clip_id)
+                    except TypeError:
+                        color, confidence, method, raw = self._vision_provider.classify_frames(frames)
                 return {"mouse_count": 1, "colors": [color], "confidence": confidence,
                         "thermometer_present": False, "method": method, "raw_response": raw,
                         "parse_status": "legacy_provider"}
@@ -363,7 +376,7 @@ class EarTagClassifier:
             logger.debug("Vision segment classification failed: %s", exc)
             return fallback
 
-    def classify_frames(self, frames: list):
+    def classify_frames(self, frames: list, clip_id: str | None = None):
         """多帧上下文颜色分类（每个 segment 一次调用）。
 
         仅使用 AI 视觉 provider，不做 CNN/HSV 回退（回退由调用方在更高层处理）。
@@ -378,7 +391,13 @@ class EarTagClassifier:
         if self._vision_provider is None:
             return "unknown", "ear_tag_color_rule", 0.0
 
-        color, confidence, method, _raw = self._vision_provider.classify_frames(frames)
+        if clip_id is None:
+            color, confidence, method, _raw = self._vision_provider.classify_frames(frames)
+        else:
+            try:
+                color, confidence, method, _raw = self._vision_provider.classify_frames(frames, clip_id=clip_id)
+            except TypeError:
+                color, confidence, method, _raw = self._vision_provider.classify_frames(frames)
 
         # 低置信度 → 视为 unknown
         if confidence < CNN_CONFIDENCE_THRESHOLD:

@@ -10,6 +10,7 @@ import numpy as np
 import logging
 import math
 import json
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime
@@ -255,6 +256,7 @@ class IdentityAssist:
         start_f = segment["start_frame"]
         end_f = segment["end_frame"]
         mid_f = (start_f + end_f) // 2
+        clip_id = self._debug_clip_id(segment.get("segment_id"), start_f)
 
         # ---- 每个 segment 重置 AI 视觉请求计数器 ----
         self._vision_request_count = 0
@@ -284,6 +286,7 @@ class IdentityAssist:
         vlm_thermometer_present = False
         _vision_used_any = False
         _vlm_context_raw_resp: dict | None = None
+        ai_api_cost_usd = 0.0
 
         if vision_enabled:
             clf_vlm = self._get_classifier()
@@ -316,7 +319,7 @@ class IdentityAssist:
                         len(context_crops), valid_context_ids,
                     )
                     try:
-                        vlm_result = clf_vlm.classify_segment_frames(context_crops)
+                        vlm_result = clf_vlm.classify_segment_frames(context_crops, clip_id=clip_id)
                         vlm_count = vlm_result.get("mouse_count")
                         vlm_colors = vlm_result.get("colors")
                         vlm_conf = vlm_result.get("confidence", 0.0)
@@ -324,6 +327,7 @@ class IdentityAssist:
                         parse_status = vlm_result.get("parse_status", "ok")
                         vlm_thermometer_present = vlm_result.get("thermometer_present", False)
                         _vlm_context_raw_resp = vlm_result.get("raw_response")
+                        ai_api_cost_usd = self._extract_ai_api_cost_usd(_vlm_context_raw_resp)
                         # A known first color is required; mouse two may explicitly be unknown.
                         if (vlm_count in (1, 2) and isinstance(vlm_colors, list)
                                 and len(vlm_colors) == vlm_count and vlm_colors[0] != "unknown"
@@ -349,7 +353,7 @@ class IdentityAssist:
                         self._save_vlm_context_debug(
                             context_crops, valid_context_ids,
                             clf_vlm._vision_provider, a_context, b_context, roi_core,
-                            error=str(exc),
+                            clip_id=clip_id, error=str(exc),
                         )
                 else:
                     logger.info("VLM context: no valid crops (frames=%r); skipping vision", context_frame_ids)
@@ -754,6 +758,7 @@ class IdentityAssist:
             "ai_colors": vlm_context_colors,
             "ai_confidence": vlm_context_confidence if _vision_used_any else 0.0,
             "ai_parse_status": "ok" if _vision_used_any else "fallback",
+            "ai_api_cost_usd": ai_api_cost_usd,
             "thermometer_present": bool(vlm_thermometer_present) if _vision_used_any else False,
             "auto_mouse_colors": auto_mouse_colors,
             "auto_mouse_ids": auto_mouse_ids,
@@ -768,7 +773,7 @@ class IdentityAssist:
                                  frame_indices: list[int],
                                  vision_provider, a_context: float, b_context: float,
                                  roi_core: dict, response_json: dict | None = None,
-                                 error: str | None = None):
+                                 clip_id: str | None = None, error: str | None = None):
         """MOUSE_COLOR_AI_SAVE_DEBUG=1 时，保存 VLM 上下文 debug 产物。
 
         保存：
@@ -782,6 +787,8 @@ class IdentityAssist:
             return
         try:
             out_dir = Path.cwd() / "debug_vision_output"
+            if clip_id:
+                out_dir /= clip_id
             out_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
@@ -802,6 +809,7 @@ class IdentityAssist:
             model_name = getattr(vision_provider, '_model', 'unknown') if vision_provider else 'none'
 
             manifest = {
+                "clip_id": clip_id,
                 "provider": provider_name,
                 "model": model_name,
                 "timestamp": datetime.now().isoformat(),
@@ -894,6 +902,25 @@ class IdentityAssist:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_ai_api_cost_usd(resp) -> float:
+        """Safely read OpenRouter's USD ``usage.cost`` from a raw VLM response."""
+        try:
+            usage = resp.get("usage")
+            cost = usage.get("cost")
+            if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+                return 0.0
+            cost = float(cost)
+            return cost if math.isfinite(cost) else 0.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _debug_clip_id(segment_id, start_frame: int) -> str:
+        """Return a filesystem-safe debug directory name for one segment."""
+        cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(segment_id or ""))[:64]
+        return cleaned or f"seg_f{start_frame}"
+
     @staticmethod
     def _ellipse(h: int, w: int, cx: float, cy: float, a: float, b: float, ang: float = 0.0) -> np.ndarray:
         m = np.zeros((h, w), dtype=np.uint8)
