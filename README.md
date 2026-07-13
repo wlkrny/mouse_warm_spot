@@ -66,8 +66,8 @@ pip install -r requirements-ai.txt
 
 **工作原理**：
 - 每个 CountSegment 选择最多 9 帧上下文图像：头三帧 (start, start+5, start+10)、中间三帧 (mid-5, mid, mid+5)、尾三帧 (end-10, end-5, end)，帧间隔为 5
-- 每帧裁剪外圈大范围图像：以 ROI 核心中心为中心，搜索 ROI（Core × 2.8）× 1.5 的矩形区域
-- 9 帧在一个请求中按时间顺序发送给 VLM，附带前/中/后上下文提示词
+- 每帧裁剪外圈大范围图像：以 ROI 核心中心为中心，搜索 ROI（Core × 2.8）× 1.5 的矩形区域；实际发送图像以细青色椭圆标出 ROI Core，不遮挡耳标
+- 9 帧在一个请求中按时间顺序发送给 VLM，附带前/中/后上下文提示词；模型只按实际接触/进入 Core 的暖点占领鼠判断数量和耳标，外圈/角落游离鼠必须忽略
 - 短 segment 帧数不足时会去重并安全夹取到 [start, end]
 
 **成本控制**：
@@ -288,7 +288,7 @@ mouse_warm_spot/
 - **Layer 1** — 隔帧粗筛 (ROI B) → 局部精查 (ROI A) → 状态机 → 占据大事件 (OccupancyEpisode)
 - **Layer 2** — 在占据事件内逐帧估计小鼠数量 → 按数量变化切分 → 计数子片段 (CountSegment)
 
-检测完成后事件列表自动填充，等待人工审核。
+检测完成后事件列表自动填充，等待人工审核。达到空档阈值的交替间隔会显示为灰色“估计数量 0”行；该行可选中检查，并与其他 CountSegment 一样进入 CSV/Markdown 导出。
 
 ### 5. 人工审核
 
@@ -326,8 +326,10 @@ mouse_warm_spot/
 1. 每隔 10 帧对 ROI B 采样，计算遮挡比例
 2. 遮挡比例 ≥ 20% → 触发精细扫描
 3. 对 ROI A 逐帧计算 5 项指标（暖色保留、深色比例、背景差异等）
-4. 状态机判断事件边界：连续 4 帧 ≥ 20% 确认进入，连续 10 帧 ≤ 8% 确认离开
-5. 过滤 < 0.8 秒的过短事件，合并间隔 < 0.8 秒的相邻事件
+4. 状态机仅以 **ROI Core（内圈）** 的占据连续性判断 clip 边界：连续 4 帧 ≥ 20% 确认进入；Core 连续空闲达到 `core_gap_tolerance_seconds`（默认 **0.3 秒**）即结束/split。短于该值的空档视为抖动。
+5. 两个已确认的占领 clip 之间，达到该阈值的 Core 空闲帧会生成独立、可导出的 `estimated_mouse_count=0` CountSegment（`start_reason=core_empty_gap`）；不为视频开头/结尾背景生成 0 clip，也不会被合并跨越。
+6. ROI Count（外圈）只用于粗筛和数量估计；外圈仍有鼠活动不能维持或合并一个 Core clip。为避免粗筛窗口重叠产生重复，后处理只去重**重叠**事件，绝不按时间空档合并两个 Core episode。检测日志会记录 `core_gap` 分割规则。
+7. 过滤 < 0.8 秒的过短事件；如实验视频帧率或噪声特性不同，可在传给 `DetectionEngine.detect` / `detect_with_counting` 的参数字典中设置 `core_gap_tolerance_seconds`。
 
 ### 小鼠计数 (Layer 2)
 
@@ -338,8 +340,9 @@ mouse_warm_spot/
   strong_dark (V < 55) | (dark_candidate (V < 95) & 背景差异 > 25)
   → 形态学去噪 (开3x3 + 闭9x9)
   → 连通区分析
-  → 碎片合并 (Union-Find 近邻聚类)
-  → 过滤: 面积 < 50px、长宽比 > 5、与 ROI A 接触 < 20px 或 < 2%
+  → 仅保留与 ROI Core 直接重叠（≥20px 且 ≥Core 2%）或在明确 3px 容差内接触的前景块；ROI Count 外圈独立块排除
+  → 对保留块碎片合并 (Union-Find 近邻聚类)
+  → 过滤: 面积 < 50px、长宽比 > 5
 
 计数:
   count_by_blob = 合并后接触 ROI A 的连通区数 (0~4)
@@ -347,6 +350,8 @@ mouse_warm_spot/
 
 综合判定:
   blob=0               → 0只, 0.9
+
+调试字段：`core_connected_blob_count`、`ignored_outer_blob_count`、`core_connected_area` 分别显示参与计数的 Core 连通块数、被排除的外圈独立块数和仅 Core 连通块的面积。
   blob=1, ratio<1.7    → 1只, 0.85
   blob=1, 1.7≤r<2.7    → 2只, 0.35 (低置信)
   blob=1, r≥2.7        → 2只, 0.25 (极低置信)

@@ -204,6 +204,17 @@ class TestParseSegmentJson(unittest.TestCase):
 class TestOpenAICompatPayload(unittest.TestCase):
     """验证 payload 构造。"""
 
+    def test_multi_frame_prompt_limits_count_and_colors_to_core_occupiers(self):
+        from detection.models.vision_provider import KimiVisionProvider
+        with patch.dict(os.environ, {
+            "KIMI_API_KEY": "sk-test", "KIMI_API_BASE": "https://example.invalid/kimi/v1",
+            "KIMI_VISION_MODEL": "test-vision-model",
+        }, clear=True):
+            text = KimiVisionProvider()._build_multi_payload(["data:image/jpeg;base64,x"], 1)["messages"][1]["content"][0]["text"]
+        assert "ROI Core" in text
+        assert "outer crop/corner" in text
+        assert "must not affect mouse_count or colors" in text
+
     def test_build_payload_includes_image(self):
         from detection.models.vision_provider import (
             KimiVisionProvider, _bgr_to_jpeg_data_uri,

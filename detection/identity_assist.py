@@ -201,12 +201,11 @@ class IdentityAssist:
     @staticmethod
     def _crop_context_frame(frame: np.ndarray, roi_core: dict,
                             a_context: float, b_context: float) -> np.ndarray | None:
-        """裁剪上下文大范围图像（Search ROI × 1.5 外圈）。
+        """Crop VLM context and mark the actual ROI Core with a thin ellipse.
 
-        以 ROI core 中心为中心，半轴为 a_context / b_context。
-        边界 clamp，绝不产生空 crop。
-
-        :returns: cropped BGR image, or None if frame is invalid
+        The marker identifies the warm spot without covering ear tags.  It is
+        drawn into the returned crop, so debug crops and provider input are the
+        same image.
         """
         h, w = frame.shape[:2]
         cx, cy = roi_core["cx"], roi_core["cy"]
@@ -216,7 +215,18 @@ class IdentityAssist:
         y2 = min(h, int(cy + b_context))
         if x2 <= x1 or y2 <= y1:
             return None
-        return frame[y1:y2, x1:x2]
+        crop = frame[y1:y2, x1:x2].copy()
+        # Keep this helper compatible with crop-only callers that provide no
+        # ellipse geometry; normal VLM calls always include a/b and get marker.
+        if "a" in roi_core and "b" in roi_core:
+            cv2.ellipse(
+                crop,
+                (int(cx - x1), int(cy - y1)),
+                (max(1, int(roi_core["a"])), max(1, int(roi_core["b"]))),
+                roi_core.get("angle", 0.0), 0, 360, (255, 255, 0), 1,
+                lineType=cv2.LINE_AA,
+            )
+        return crop
 
     # ------------------------------------------------------------------
     # Main detection
@@ -796,7 +806,7 @@ class IdentityAssist:
                 "timestamp": datetime.now().isoformat(),
                 "frame_indices": frame_indices,
                 "num_context_crops": len(context_crops),
-                "crop_algorithm": "Search_ROI * 1.5 centered at ROI core (search_roi = core * SEARCH_SCALE)",
+                "crop_algorithm": "Search_ROI * 1.5 centered at ROI core (search_roi = core * SEARCH_SCALE), with a 1px cyan ROI Core ellipse drawn into the provider/debug image",
                 "crop_range": {
                     "cx": roi_core["cx"],
                     "cy": roi_core["cy"],

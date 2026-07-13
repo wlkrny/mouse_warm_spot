@@ -33,6 +33,10 @@ class MouseCounter:
     # ---- ROI A 接触最小重叠 ----
     ROIA_MIN_OVERLAP_PX = 20
     ROIA_MIN_OVERLAP_RATIO = 0.02
+    # A component may reach the Core boundary through a tiny segmentation gap.
+    # This tolerance is deliberately small and applies only to already filtered
+    # foreground components; it never turns the Core mask itself into foreground.
+    CORE_CONTACT_TOLERANCE_PX = 3
 
     # ---- 碎片合并距离阈值 ----
     MERGE_DISTANCE_RATIO = 0.25     # 边界距离 < 单鼠宽度 × 0.25
@@ -204,21 +208,28 @@ class MouseCounter:
                 "label_id": label_id,
             })
 
-        # ---- 9. 检查每个blob是否与ROI Core接触 (使用原始labels) ----
+        # ---- 9. Keep only foreground components connected to ROI Core. ----
+        # This happens *before* nearby-fragment merging: an independent mouse in
+        # ROI Count must not be merged into a Core occupant merely by proximity.
+        core_connected_pre_blobs = []
+        ignored_outer_blob_count = 0
         for b in pre_blobs:
             b["touching_core"] = self._blob_touches_roi_a(
                 labels, b["label_id"], roi_core_mask, cleaned,
                 b["left"], b["top"], b["width"], b["height"],
-                roi_core_pixel_count
+                roi_core_pixel_count, self.CORE_CONTACT_TOLERANCE_PX
             )
+            if b["touching_core"]:
+                core_connected_pre_blobs.append(b)
+            else:
+                ignored_outer_blob_count += 1
 
-        # ---- 10. 碎片合并 ----
-        valid_blobs = self._merge_nearby_blobs(pre_blobs)
+        # ---- 10. Merge only Core-connected fragments. ----
+        valid_blobs = self._merge_nearby_blobs(core_connected_pre_blobs)
 
         # ---- 11. 统计 ----
         blob_count = len(valid_blobs)
-        # count_by_blob: 合并后接触ROI A的blob数
-        core_touching = [b for b in valid_blobs if b["touching_core"]]
+        core_touching = valid_blobs
         core_touching_blob_count = len(core_touching)
         count_by_blob = core_touching_blob_count if core_touching_blob_count >= 1 else 0
         count_by_blob = min(MouseCounter.MAX_WARM_SPOT_OCCUPANTS, count_by_blob)
@@ -280,6 +291,9 @@ class MouseCounter:
             "total_mouse_area": float(total_mouse_area),
             "largest_blob_area": float(largest_blob_area),
             "core_touching_blob_count": core_touching_blob_count,
+            "core_connected_blob_count": core_touching_blob_count,
+            "ignored_outer_blob_count": ignored_outer_blob_count,
+            "core_connected_area": float(total_mouse_area),
             "count_confidence": count_confidence,
             "blob_count": blob_count,
             # 新增调试字段
@@ -497,22 +511,28 @@ class MouseCounter:
     @staticmethod
     def _blob_touches_roi_a(labels, label_id, roi_a_mask, mask_img,
                             left, top, blob_w, blob_h,
-                            roi_a_pixel_count: int = 0) -> bool:
-        """
-        检查连通区域是否与 ROI A 有足够重叠
-        条件: 重叠像素 >= 20px 且 >= ROI_A面积的2%
+                            roi_a_pixel_count: int = 0,
+                            tolerance_px: int = 0) -> bool:
+        """Return whether one foreground component is connected to ROI Core.
+
+        A substantial direct overlap uses the established overlap thresholds.
+        Otherwise a component may reach a *small* dilated Core boundary.  The
+        component is still selected by its own label, so neither the Core mask
+        nor unrelated outer blobs can become foreground by this operation.
         """
         label_crop = labels[top:top + blob_h, left:left + blob_w]
         roi_a_crop = roi_a_mask[top:top + blob_h, left:left + blob_w]
-        blob_in_roi = (label_crop == label_id) & (roi_a_crop > 0)
-        overlap_px = int(np.count_nonzero(blob_in_roi))
-        if overlap_px < MouseCounter.ROIA_MIN_OVERLAP_PX:
+        blob_pixels = label_crop == label_id
+        overlap_px = int(np.count_nonzero(blob_pixels & (roi_a_crop > 0)))
+        if overlap_px >= MouseCounter.ROIA_MIN_OVERLAP_PX:
+            if roi_a_pixel_count <= 0 or overlap_px / roi_a_pixel_count >= MouseCounter.ROIA_MIN_OVERLAP_RATIO:
+                return True
+        if tolerance_px <= 0:
             return False
-        if roi_a_pixel_count > 0:
-            overlap_ratio = overlap_px / roi_a_pixel_count
-            if overlap_ratio < MouseCounter.ROIA_MIN_OVERLAP_RATIO:
-                return False
-        return True
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tolerance_px * 2 + 1,) * 2)
+        expanded_core = cv2.dilate(roi_a_mask, k)
+        expanded_crop = expanded_core[top:top + blob_h, left:left + blob_w]
+        return bool(np.any(blob_pixels & (expanded_crop > 0)))
 
     # ------------------------------------------------------------------
     # 多鼠参考面积 (标记 [2][3][4] 帧时存储)
@@ -674,6 +694,9 @@ class MouseCounter:
             "total_mouse_area": 0.0,
             "largest_blob_area": 0.0,
             "core_touching_blob_count": 0,
+            "core_connected_blob_count": 0,
+            "ignored_outer_blob_count": 0,
+            "core_connected_area": 0.0,
             "count_confidence": 0.0,
             "blob_count": 0,
             "area_ratio": 0.0,

@@ -41,6 +41,10 @@ class DetectionEngine:
         "forward_confirm_seconds": 1.0,
         "min_on_frames": DetectionMetrics.CONFIRM_ON_FRAMES,
         "min_off_frames": DetectionMetrics.CONFIRM_OFF_FRAMES,
+        # Core must stay empty this long before an OccupancyEpisode ends.
+        # This replaces cross-episode time-gap merging: only Core occupancy
+        # continuity may determine a clip boundary.
+        "core_gap_tolerance_seconds": 0.3,
         "min_event_duration_seconds": 0.8,
         "merge_gap_seconds": 0.8,
         "review_padding_seconds": 1.0,
@@ -134,9 +138,12 @@ class DetectionEngine:
 
         self._notify(progress_callback, 93, f"过滤 {n_filtered} 个过短事件, 剩余 {len(events)} 个")
 
+        # Fine scans can overlap because their coarse-trigger windows overlap.
+        # Deduplicate only overlapping copies of the same Core episode; never
+        # merge distinct episodes across a Core-empty gap.
         events = self._merge_adjacent_events(events, fps, p)
 
-        self._notify(progress_callback, 96, f"合并后 {len(events)} 个事件")
+        self._notify(progress_callback, 96, f"去重后 {len(events)} 个事件（Core 空档保留为分割）")
 
         events = self._add_review_padding(events, fps, p)
 
@@ -210,8 +217,15 @@ class DetectionEngine:
             episodes.append(episode)
             all_segments.extend(segments)
 
+        # A qualifying Core-empty interval belongs to the timeline too.  Emit a
+        # canonical CountSegment after occupied clips have been counted; it is
+        # deliberately not fed through occupied-only smoothing/short filters.
+        gap_segments = self._build_core_empty_gap_segments(raw_events, fps, p)
+        all_segments.extend(gap_segments)
+        all_segments.sort(key=lambda s: (s["start_frame"], s["end_frame"]))
+
         self._notify(progress_callback, 100,
-                     f"两层检测完成! {len(episodes)} 个占据大事件, {len(all_segments)} 个计数子片段")
+                     f"两层检测完成! {len(episodes)} 个占据大事件, {len(all_segments)} 个计数子片段（含 {len(gap_segments)} 个0鼠空档）")
 
         # ---- Phase 10: 输出检测日志 ----
         self._log_detection_summary(
@@ -450,6 +464,63 @@ class DetectionEngine:
 
         episode["child_segment_ids"] = child_ids
         return episode, count_segments
+
+    @staticmethod
+    def _build_core_empty_gap_segments(events: list[dict], fps: float, params: dict) -> list[dict]:
+        """Build visible zero-count timeline segments between confirmed Core clips.
+
+        The gap starts at the first confirmed Core-empty frame (previous end +
+        1) and ends immediately before the next occupied clip.  It is emitted
+        only between two occupied episodes and only when it meets the same
+        ``core_gap_tolerance_seconds`` used to split them, avoiding background
+        zero clips before the first or after the last occupancy.
+        """
+        if fps <= 0:
+            return []
+        ordered = sorted(events, key=lambda e: e["start_frame"])
+        min_gap_frames = max(1, int(np.ceil(
+            params["core_gap_tolerance_seconds"] * fps
+        )))
+        result = []
+        for previous, following in zip(ordered, ordered[1:]):
+            start_frame = previous["end_frame"] + 1
+            end_frame = following["start_frame"] - 1
+            frame_count = end_frame - start_frame + 1
+            if frame_count < min_gap_frames:
+                continue
+            gap_index = len(result) + 1
+            result.append({
+                "segment_id": f"core-empty-{gap_index:03d}",
+                "episode_id": "core-empty-gap",
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "start_time": start_frame / fps,
+                "end_time": end_frame / fps,
+                "duration": (end_frame - start_frame) / fps,
+                "estimated_mouse_count": 0,
+                "confirmed_mouse_count": None,
+                "mouse_ids": [],
+                "mouse_count": 0,
+                "count_confidence": 1.0,
+                "count_status": "pending",
+                "detected_by": "auto",
+                "modified_by_user": False,
+                "reviewer": "",
+                "note": "ROI Core confirmed empty gap",
+                "count_note": "ROI Core confirmed empty gap",
+                "needs_review": False,
+                "is_short_event": False,
+                "is_possible_false_positive": False,
+                "start_reason": "core_empty_gap",
+                "end_reason": "core_gap_end",
+                "auto_mouse_colors": [],
+                "auto_mouse_ids": [],
+                "identity_confidence": 0.0,
+                "identity_needs_review": False,
+                "identity_conflict": False,
+                "identity_method": "not_applicable_core_empty_gap",
+            })
+        return result
 
     @staticmethod
     def _median_smooth_counts(raw_counts: list[dict], window: int) -> list[int]:
@@ -783,7 +854,12 @@ class DetectionEngine:
         occupy_threshold = params["occupy_area_threshold"]
         release_threshold = params["release_area_threshold"]
         min_on = params["min_on_frames"]
-        min_off = params["min_off_frames"]
+        # The clip split tolerance is time-based so it remains stable across
+        # videos with different FPS.  ceil means an empty run at the configured
+        # duration is sufficient, while shorter runs are treated as jitter.
+        core_gap_frames = max(1, int(np.ceil(
+            params["core_gap_tolerance_seconds"] * fps
+        )))
 
         state = self.IDLE
         on_counter = 0          # 连续满足进入条件的帧数
@@ -800,12 +876,14 @@ class DetectionEngine:
         # 逐帧遍历
         total = search_end - search_start + 1
         cap.set(1, search_start)
+        last_frame_read = search_start - 1
 
         for local_idx in range(total):
             ret, frame = cap.read()
             if not ret:
                 break
             global_frame = search_start + local_idx
+            last_frame_read = global_frame
 
             metrics = self._metrics.compute(frame, roi_core, background_bgr)
             occ_ratio = metrics.get("occlusion_area_ratio", 0.0)
@@ -857,8 +935,10 @@ class DetectionEngine:
                     off_counter = 0
                 elif occ_ratio <= release_threshold:
                     off_counter += 1
-                    if off_counter >= min_off:
-                        # 确认离开: 事件结束帧 = 离开前最后一帧
+                    if off_counter >= core_gap_frames:
+                        # Core has been empty for the configured tolerance.
+                        # End on the last Core-occupied frame; ROI Count is not
+                        # consulted here and therefore cannot bridge this gap.
                         event_end = global_frame - off_counter
                         state = self.IDLE
 
@@ -886,6 +966,8 @@ class DetectionEngine:
                                 "max_background_diff_score": float(max_bg),
                                 "dark_pixel_max": float(max_dark),
                                 "bg_diff_max": float(max_bg),
+                                "end_reason": "core_gap",
+                                "core_gap_frames": off_counter,
                             })
 
                         on_counter = 0
@@ -901,7 +983,7 @@ class DetectionEngine:
 
         # 如果扫描结束时仍处于 OCCUPIED/CANDIDATE 状态, 收尾
         if state in (self.OCCUPIED, self.CANDIDATE_OFF) and event_start >= 0:
-            event_end = search_start + total - 1
+            event_end = last_frame_read
             if event_end >= event_start and current_occ_ratios:
                 avg_occ = float(np.mean(current_occ_ratios))
                 max_occ = float(max(current_occ_ratios))
@@ -920,6 +1002,8 @@ class DetectionEngine:
                     "max_background_diff_score": max_bg,
                     "dark_pixel_max": max_dark,
                     "bg_diff_max": max_bg,
+                    "end_reason": "scan_end",
+                    "core_gap_frames": 0,
                 })
 
         return events
@@ -952,18 +1036,20 @@ class DetectionEngine:
     # 后处理: 合并相邻事件 (规范 14.2)
     # ------------------------------------------------------------------
     def _merge_adjacent_events(self, events, fps, params):
-        """合并间隔 < merge_gap_seconds 的相邻事件"""
+        """Deduplicate overlapping fine-scan copies without crossing Core gaps.
+
+        ``merge_gap_seconds`` is intentionally not used for OccupancyEpisodes:
+        merging separated events would make an empty ROI Core gap disappear.
+        """
         if not events:
             return []
 
-        merge_gap_frames = int(params["merge_gap_seconds"] * fps)
         events = sorted(events, key=lambda e: e["start_frame"])
 
         merged = [events[0]]
         for evt in events[1:]:
             prev = merged[-1]
-            gap = evt["start_frame"] - prev["end_frame"]
-            if gap <= merge_gap_frames:
+            if evt["start_frame"] <= prev["end_frame"]:
                 # 合并
                 merged[-1] = {
                     **prev,
@@ -1019,12 +1105,18 @@ class DetectionEngine:
             f"  参数: stride={params.get('coarse_stride_frames','?')} "
             f"occ_thr={params.get('occupy_area_threshold','?')} "
             f"rel_thr={params.get('release_area_threshold','?')} "
-            f"on={params.get('min_on_frames','?')} off={params.get('min_off_frames','?')}",
+            f"on={params.get('min_on_frames','?')} core_gap={params.get('core_gap_tolerance_seconds','?')}s "
+            f"(Core-empty gap splits clip)",
             f"  FPS: {fps:.2f}",
         ]
 
         # 大事件统计
         log_lines.append(f"  OccupancyEpisodes: {len(episodes)}")
+        core_gap_splits = sum(1 for e in episodes if e.get("end_reason") == "core_gap")
+        log_lines.append(
+            f"    Core-gap splits: {core_gap_splits} "
+            f"(tolerance={params.get('core_gap_tolerance_seconds', '?')}s)"
+        )
         short_ep = sum(1 for e in episodes if e.get("is_short_event", False))
         if short_ep:
             log_lines.append(f"    短事件(<0.8s): {short_ep}")
@@ -1034,6 +1126,8 @@ class DetectionEngine:
 
         # 子片段统计
         log_lines.append(f"  CountSegments: {len(segments)}")
+        zero_gaps = sum(1 for s in segments if s.get("start_reason") == "core_empty_gap")
+        log_lines.append(f"    Confirmed Core-empty 0-count gaps: {zero_gaps}")
 
         # count 分布
         count_dist: dict[int, int] = {}

@@ -514,8 +514,10 @@ class _OpenAICompatVisionProvider(VisionProvider):
                 "text": (
                     f"You are analyzing {n} context frames from the SAME video clip of a mouse experiment, "
                     f"sampled from {group_desc} in chronological order. "
-                    "Determine whether ONE or TWO mice simultaneously occupy the warm-spot region during this same segment. "
-                    "Do not invent a second mouse from reflections, afterimages, or mice replacing each other at different times. "
+                    "The thin cyan ellipse marks ROI Core, the warm-spot inner circle. Count and identify ear-tag colors ONLY for mouse(s) actually occupying, touching, or entering that marked Core during this segment. "
+                    "Ignore any mouse that remains only in the outer crop/corner or outside ROI Core: it must not affect mouse_count or colors. "
+                    "Determine whether ONE or TWO mice simultaneously occupy the marked warm-spot Core during this same segment. "
+                    "Do not invent a second mouse from reflections, afterimages, mice replacing each other at different times, or an outer-ring mouse. "
                     "Also determine whether any frame shows a handheld thermometer, temperature probe, or other non-mouse device obstructing or intruding into the warm-spot area. "
                     "Do not mistake the warm spot, reflections, or mouse ear tags for an instrument. "
                     "If uncertain choose 1 with low confidence and unknown color(s). Return each mouse's ear-tag color in order. "
