@@ -85,10 +85,12 @@ pip install -r requirements-ai.txt
 
 | 环境变量 | 说明 | 默认值 |
 |---|---|---|
-| `MOUSE_COLOR_AI_PROVIDER` | 本功能使用的视觉识别 provider：`gpt`（或 `hsv` 禁用） | `hsv`（仅使用 HSV 规则） |
+| `MOUSE_COLOR_AI_PROVIDER` | 本功能使用的视觉识别 provider：`kimi` / `minimax` / `openrouter` / `gpt`（或 `hsv` 禁用） | `hsv`（仅使用 HSV 规则） |
 | `MOUSE_COLOR_AI_TIMEOUT` | API 请求超时秒数 | `30` |
 | `MOUSE_COLOR_AI_MAX_TOKENS` | AI 视觉输出 token 上限（必须为正整数；对带 reasoning 的模型建议 ≥512） | `512` |
 | `MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT` | 每个 segment 最多云视觉请求数（`0`=禁用云视觉） | `3` |
+| `MOUSE_COLOR_BATCH_CONCURRENCY` | 批量颜色识别并发数上限（1=串行, 2=默认, 最大4；非法值自动回退2） | `2` |
+| `MOUSE_COLOR_AI_SAVE_DEBUG` | `1`=保存每次 VLM 请求的 context crop / response / manifest 到 `debug_vision_output/<clip_id>/` | 不保存 |
 
 ### Kimi (Moonshot) 所需环境变量（全部必填）：
 
@@ -178,10 +180,12 @@ KIMI_API_KEY=<your-api-key> KIMI_API_BASE=<provider-base-url> KIMI_VISION_MODEL=
 
 **Debug 排错**：
 
-设置 `MOUSE_COLOR_AI_SAVE_DEBUG=1` 后，每次 segment 的 VLM 上下文请求保存到 `debug_vision_output/`：
+设置 `MOUSE_COLOR_AI_SAVE_DEBUG=1` 后，每次 segment 的 VLM 上下文请求保存到 `debug_vision_output/<clip_id>/` 子目录：
 - 所有 context crops（文件名含排序编号和原视频帧索引）
 - API 响应 JSON（成功或失败均保存）
-- Manifest JSON（provider/model 不含 API key、选中帧索引、crop 算法/范围、解析结果或错误信息）
+- Manifest JSON（provider/model 不含 API key、clip_id、选中帧索引、crop 算法/范围、解析结果或错误信息）
+
+每个 clip 独立子目录，便于按 segment 排查问题。
 
 **provider 架构**：
 - `VisionProvider` (ABC): 抽象接口 `classify(patch_bgr) → (color, confidence, method)` + `classify_frames(frames) → (color, confidence, method, raw_json)`
@@ -232,6 +236,8 @@ mouse_warm_spot/
 │   ├── engine.py                # 全视频两层检测引擎 (OccupancyEpisode + CountSegment)
 │   ├── counter.py               # 小鼠数量估计引擎 (MouseCounter)
 │   ├── identity_assist.py       # 耳标颜色辅助检测（HSV 规则 + 可选 ONNX CNN）
+│   ├── color_mouse_mapping.py   # 颜色到鼠号的持久一对一映射
+│   ├── batch_color.py           # 批量颜色识别并发工具
 │   └── models/                  # AI 推理模型
 │       ├── __init__.py
 │       ├── classifier.py        # EarTagClassifier: ONNX 包装器 + HSV 回退
@@ -241,9 +247,11 @@ mouse_warm_spot/
 │   └── csv_exporter.py          # CSV/Markdown 导出
 └── tests/
     ├── __init__.py
-    ├── test_color_classifier.py    # 颜色分类器单元测试
-    ├── test_vision_provider.py     # AI 视觉 provider 单元测试
-    └── test_thermometer.py         # 温度计检测单元测试
+    ├── test_color_classifier.py         # 颜色分类器单元测试
+    ├── test_vision_provider.py          # AI 视觉 provider 单元测试
+    ├── test_thermometer.py              # 温度计检测单元测试
+    ├── test_core_clip_splitting.py      # Core 分割边界回归测试
+    └── test_core_connected_counting.py  # Core 接触计数回归测试
 ```
 
 ---
@@ -398,3 +406,5 @@ mouse_warm_spot/
 | 文件 → 退出 (Ctrl+Q) | 退出程序 |
 | 视图 → 暖点放大窗口 | 显示/隐藏放大窗口 |
 | 视图 → 检测指标 | 显示/隐藏指标面板 |
+| 视图 → Debug 视图 | 显示/隐藏原始检测标注叠加 |
+| 视图 → 管理颜色-鼠号映射... | 查看/重置颜色到鼠号的持久映射 |
