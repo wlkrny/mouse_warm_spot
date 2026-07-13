@@ -174,7 +174,7 @@ KIMI_API_KEY=<your-api-key> KIMI_API_BASE=<provider-base-url> KIMI_VISION_MODEL=
 | VLM 返回 unknown 或置信度 < 0.3 | 视为失败，消耗预算，回退到 CNN/HSV |
 | Segment 无有效 context crop | 不消耗预算，直接走 CNN/HSV |
 
-**GUI 范围选择**：点击“颜色识别”后选择“当前事件”“全部事件”或“取消”。未选事件时“当前事件”不可用，但仍可选择“全部事件”。全部事件仅处理非空片段，使用一个后台 worker 串行执行（不并发云请求）；进度显示当前 i/N、事件 ID 和内部进度，取消会停止后续事件并保留已完成结果。每个完成事件立即更新事件列表和标注面板。
+**GUI 范围选择与并发**：点击“颜色识别”后选择“当前事件”“全部事件”或“取消”。未选事件时“当前事件”不可用。全部事件跳过 0 鼠片段，默认以 **2** 个独立任务受限并发运行（`MOUSE_COLOR_BATCH_CONCURRENCY=1` 为串行，最大 **4**；非法值回退 2），每任务拥有独立 VideoCapture/IdentityAssist，仍不增加每 segment 的 VLM 请求预算。进度显示真实完成数/总数和当前事件 ID；取消不再提交未启动任务，运行任务安全完成且其结果保留。并发会增加 provider 同时请求和成本峰值，请保持保守默认值。
 
 **Debug 排错**：
 
@@ -310,6 +310,12 @@ mouse_warm_spot/
 - `[x] 误检` — 标记当前片段为误检
 - `保存并下一个` — 保存并自动跳到下一个待审核片段
 
+### 5.1 颜色→鼠号自动记忆
+
+颜色识别得到完整、非冲突的已知颜色时，系统自动分配最小可用鼠号（1–4），例如首次 green→1、red→2；同色后续复用既有编号，不同颜色不会自动共用编号。映射保存在用户目录 `~/.mouse_warm_spot/color_mouse_mapping.json`，不含任何密钥。unknown、重复双鼠颜色、冲突、测温器干扰、0 鼠 clip 和人工 confirmed 事件均不会自动分配/覆盖，而是保守标记复核。
+
+在 **视图 → 管理颜色-鼠号映射...** 可查看当前映射并“重置全部映射”。全部事件批处理结束会弹出总数、成功、测温器干扰、需复核、失败/取消和当前映射摘要；单事件状态栏显示自动分配的鼠号。
+
 ### 6. 导出
 
 菜单 `文件 → 导出Markdown统计表...` 生成报告，包含：
@@ -326,8 +332,8 @@ mouse_warm_spot/
 1. 每隔 10 帧对 ROI B 采样，计算遮挡比例
 2. 遮挡比例 ≥ 20% → 触发精细扫描
 3. 对 ROI A 逐帧计算 5 项指标（暖色保留、深色比例、背景差异等）
-4. 状态机仅以 **ROI Core（内圈）** 的占据连续性判断 clip 边界：连续 4 帧 ≥ 20% 确认进入；Core 连续空闲达到 `core_gap_tolerance_seconds`（默认 **0.3 秒**）即结束/split。短于该值的空档视为抖动。
-5. 两个已确认的占领 clip 之间，达到该阈值的 Core 空闲帧会生成独立、可导出的 `estimated_mouse_count=0` CountSegment（`start_reason=core_empty_gap`）；不为视频开头/结尾背景生成 0 clip，也不会被合并跨越。
+4. 状态机仅以 **ROI Core（内圈）** 的连续性判断 clip 边界：连续 4 帧 ≥ 20% 确认进入；Core 连续空闲达到 `core_gap_tolerance_seconds`（默认 **0.3 秒**）即结束/split。空闲的双条件为 `is_occupied=false`，**或**综合 `occlusion_area_ratio` 低于 `core_empty_occupancy_threshold`（默认 **0.04**，范围严格 clamp 到 0~1）；后者优先于可能过时的 occupied 标记。阈值刻意低于 8% release 阈值，避免正常近阈值噪声切段。
+5. 两个已确认的占领 clip 之间，达到该阈值的 Core 空闲帧会生成独立、可导出的 `estimated_mouse_count=0` CountSegment（`start_reason=core_empty_gap`）；其 debug 字段含 `core_empty_reason` 和 min/max/mean/threshold occupancy。不会为视频开头/结尾背景生成 0 clip，也不会被合并跨越。
 6. ROI Count（外圈）只用于粗筛和数量估计；外圈仍有鼠活动不能维持或合并一个 Core clip。为避免粗筛窗口重叠产生重复，后处理只去重**重叠**事件，绝不按时间空档合并两个 Core episode。检测日志会记录 `core_gap` 分割规则。
 7. 过滤 < 0.8 秒的过短事件；如实验视频帧率或噪声特性不同，可在传给 `DetectionEngine.detect` / `detect_with_counting` 的参数字典中设置 `core_gap_tolerance_seconds`。
 

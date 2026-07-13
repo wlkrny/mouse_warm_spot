@@ -7,6 +7,7 @@
 import os
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import cv2
 import numpy as np
 
@@ -29,6 +30,8 @@ from detection.metrics import DetectionMetrics
 from detection.engine import DetectionEngine
 from detection.counter import MouseCounter
 from detection.identity_assist import IdentityAssist, apply_identity_to_segment
+from detection.color_mouse_mapping import ColorMouseMappingStore
+from detection.batch_color import batch_color_concurrency, batch_items, batch_summary
 from export.csv_exporter import CsvExporter
 
 
@@ -168,7 +171,7 @@ class ColorIdentifyWorker(QThread):
 # 主窗口
 # =========================================================================
 class BatchColorIdentifyWorker(QThread):
-    """串行识别多个 segment；所有界面更新由主线程的 slot 完成。"""
+    """Bounded-concurrent recognition; UI changes remain queued to main slots."""
     item_started = Signal(int, int, int)  # index, ordinal, total
     item_progress = Signal(int, int, int, str)  # index, ordinal, percent, message
     item_finished = Signal(int, dict)
@@ -182,38 +185,57 @@ class BatchColorIdentifyWorker(QThread):
         self._video_path = video_path
         self._fps = fps
         self._cancelled = False
+        self._concurrency = batch_color_concurrency()
 
     def cancel(self):
         self._cancelled = True
 
     def run(self):
-        cap = None
-        try:
+        total = len(self._items)
+        # Every task owns its VideoCapture and IdentityAssist, so OpenCV and
+        # provider state are not shared. Signals queue UI changes to main slots.
+        def analyze(index, ordinal, segment):
             cap = cv2.VideoCapture(self._video_path)
             if not cap.isOpened():
-                self.item_error.emit(-1, f"无法打开视频: {self._video_path}")
-                return
-            total = len(self._items)
-            for ordinal, (index, segment) in enumerate(self._items, 1):
-                if self._cancelled:
-                    break
+                raise RuntimeError(f"无法打开视频: {self._video_path}")
+            try:
                 self.item_started.emit(index, ordinal, total)
-                try:
-                    result = IdentityAssist(debug=True).analyze_segment(
-                        segment=segment, roi_core=self._roi_core, cap=cap, fps=self._fps,
-                        progress_callback=lambda pct, msg, i=index, o=ordinal:
-                            self.item_progress.emit(i, o, pct, msg),
-                    )
-                    if not self._cancelled:
-                        self.item_finished.emit(index, result)
-                except Exception as exc:
-                    self.item_error.emit(index, str(exc))
+                return IdentityAssist(debug=True).analyze_segment(
+                    segment=segment, roi_core=self._roi_core, cap=cap, fps=self._fps,
+                    progress_callback=lambda pct, msg:
+                        self.item_progress.emit(index, ordinal, pct, msg),
+                )
+            finally:
+                cap.release()
+
+        pending = iter(enumerate(self._items, 1))
+        running = {}
+        try:
+            with ThreadPoolExecutor(max_workers=self._concurrency) as executor:
+                while not self._cancelled and len(running) < self._concurrency:
+                    try:
+                        ordinal, (index, segment) = next(pending)
+                    except StopIteration:
+                        break
+                    running[executor.submit(analyze, index, ordinal, segment)] = index
+                while running:
+                    done, _ = wait(running, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        index = running.pop(future)
+                        try:
+                            self.item_finished.emit(index, future.result())
+                        except Exception as exc:
+                            self.item_error.emit(index, str(exc))
+                    while not self._cancelled and len(running) < self._concurrency:
+                        try:
+                            ordinal, (index, segment) = next(pending)
+                        except StopIteration:
+                            break
+                        running[executor.submit(analyze, index, ordinal, segment)] = index
             self.finished_batch.emit(self._cancelled)
         except Exception as exc:
             self.item_error.emit(-1, str(exc))
-        finally:
-            if cap is not None:
-                cap.release()
+            self.finished_batch.emit(self._cancelled)
 
 
 class MainWindow(QMainWindow):
@@ -243,6 +265,9 @@ class MainWindow(QMainWindow):
         self._color_worker = None
         self._batch_color_worker = None
         self._batch_color_progress = None
+        self._batch_color_results: list[dict] = []
+        self._batch_color_failures = 0
+        self._color_mapping_store = ColorMouseMappingStore()
 
         # 校准标记系统 (Phase 1+2: CalibrationStore 接管)
         self._calib_store = CalibrationStore()
@@ -349,6 +374,10 @@ class MainWindow(QMainWindow):
 
         view_menu.addSeparator()
 
+        mapping_action = QAction("管理颜色-鼠号映射...", self)
+        mapping_action.triggered.connect(self._on_manage_color_mapping)
+        view_menu.addAction(mapping_action)
+
         # Phase 10: Debug 视图开关
         self._debug_view_action = QAction("Debug 视图(&D)", self)
         self._debug_view_action.setCheckable(True)
@@ -447,7 +476,7 @@ class MainWindow(QMainWindow):
 
         # 颜色识别（可选择当前事件或全部事件）
         self._btn_color = QPushButton("颜色识别")
-        self._btn_color.setToolTip("识别当前事件或串行识别全部事件")
+        self._btn_color.setToolTip("识别当前事件或受限并发识别全部事件")
         self._btn_color.clicked.connect(self._on_color_identify)
         self._btn_color.setMinimumHeight(30)
         self._btn_color.setEnabled(False)
@@ -1671,14 +1700,14 @@ class MainWindow(QMainWindow):
         seg = self._event_list.get_segment(index)
         if seg is None:
             return
-        apply_identity_to_segment(seg, result)
+        apply_identity_to_segment(seg, result, self._color_mapping_store)
         self._event_list._update_row(index)
         if index == self._current_review_idx:
             self._annotation_panel.set_event(index, seg)
         return seg
 
     def _on_color_finished(self, progress, index, result):
-        """保留当前事件的人工颜色→鼠号确认；测温器结果直接安全写回。"""
+        """自动复用持久颜色→鼠号映射；确认事件永不覆盖。"""
         progress.close()
         seg = self._event_list.get_segment(index)
         if seg is None:
@@ -1688,32 +1717,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "颜色识别", "检测到测温器/探头，颜色识别置信度已置零，请人工复核。")
             self._statusbar.showMessage(f"颜色识别完成: 事件 #{seg.get('segment_id')}，置信度 0.00")
             return
-        valid_colors = [c for c in result.get("auto_mouse_colors", []) if c != "unknown"]
-        if not valid_colors:
-            QMessageBox.information(self, "颜色识别", "未检测到有效耳标颜色。")
-            return
-        mouse_ids = []
-        for color in valid_colors:
-            mid, ok = QInputDialog.getInt(self, f"识别到 {color}",
-                                           f"检测到耳标颜色: {color}\n请选择对应的鼠号 (1-4):",
-                                           value=1, minValue=1, maxValue=4, step=1)
-            if ok:
-                mouse_ids.append(mid)
-        if mouse_ids:
-            self._apply_color_result(index, result)
-            seg["mouse_ids"] = mouse_ids
-            seg["mouse_count"] = len(mouse_ids)
-            seg["count_status"] = "confirmed"
-            self._event_list.update_segment_mouse_ids(index, mouse_ids)
-            self._event_list.update_segment_status(index, "confirmed")
-            if index == self._current_review_idx:
-                self._annotation_panel.set_event(index, seg)
-        self._statusbar.showMessage(f"颜色识别完成: 事件 #{seg.get('segment_id')}，置信度 {result.get('identity_confidence', 0):.2f}")
+        updated = self._apply_color_result(index, result)
+        assigned = updated.get("mouse_ids", []) if updated else []
+        suffix = f"，自动分配小鼠 {assigned}" if assigned else "，需人工复核"
+        self._statusbar.showMessage(
+            f"颜色识别完成: 事件 #{seg.get('segment_id')}，置信度 {result.get('identity_confidence', 0):.2f}{suffix}"
+        )
 
     def _start_batch_color_identify(self, roi_data):
-        items = [(i, seg) for i, seg in enumerate(self._event_list.get_segments())
-                 if seg.get("start_frame") is not None and seg.get("end_frame") is not None
-                 and seg["end_frame"] >= seg["start_frame"]]
+        items = batch_items(self._event_list.get_segments())
         if not items:
             QMessageBox.information(self, "颜色识别", "没有可处理的非空事件。")
             return
@@ -1722,9 +1734,11 @@ class MainWindow(QMainWindow):
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         self._batch_color_progress = progress
+        self._batch_color_results = []
+        self._batch_color_failures = 0
         self._batch_color_worker = BatchColorIdentifyWorker(items, roi_data["roi_core"], self._video_widget.video_path, self._video_widget.fps, self)
-        self._batch_color_worker.item_started.connect(lambda idx, i, n: progress.setLabelText(f"当前 {i}/{n}: 事件 #{self._event_list.get_segment(idx).get('segment_id')}"))
-        self._batch_color_worker.item_progress.connect(lambda idx, i, pct, msg: (progress.setLabelText(f"当前 {i}/{len(items)}: 事件 #{self._event_list.get_segment(idx).get('segment_id')} — {msg}"), progress.setValue(pct)))
+        self._batch_color_worker.item_started.connect(lambda idx, i, n: progress.setLabelText(f"已启动 {i}/{n}: 事件 #{self._event_list.get_segment(idx).get('segment_id')}"))
+        self._batch_color_worker.item_progress.connect(lambda idx, i, pct, msg: (progress.setLabelText(f"进行中（完成数随后更新）: 事件 #{self._event_list.get_segment(idx).get('segment_id')} — {msg}"), progress.setValue(pct)))
         self._batch_color_worker.item_finished.connect(self._on_batch_color_finished)
         self._batch_color_worker.item_error.connect(self._on_batch_color_error)
         self._batch_color_worker.finished_batch.connect(self._on_batch_color_done)
@@ -1734,11 +1748,16 @@ class MainWindow(QMainWindow):
     @Slot(int, dict)
     def _on_batch_color_finished(self, index, result):
         seg = self._apply_color_result(index, result)
+        self._batch_color_results.append(result)
         if seg:
-            self._statusbar.showMessage(f"颜色识别完成: 事件 #{seg.get('segment_id')}，置信度 {result.get('identity_confidence', 0):.2f}")
+            self._statusbar.showMessage(
+                f"已完成 {len(self._batch_color_results)}/{len(self._batch_color_worker._items)}: "
+                f"事件 #{seg.get('segment_id')}，自动鼠号 {seg.get('mouse_ids', [])}"
+            )
 
     @Slot(int, str)
     def _on_batch_color_error(self, index, error_msg):
+        self._batch_color_failures += 1
         label = "视频" if index < 0 else f"事件 #{self._event_list.get_segment(index).get('segment_id')}"
         self._statusbar.showMessage(f"颜色识别失败 ({label})，将继续: {error_msg.splitlines()[0]}")
 
@@ -1746,7 +1765,27 @@ class MainWindow(QMainWindow):
     def _on_batch_color_done(self, cancelled):
         if self._batch_color_progress:
             self._batch_color_progress.close()
+        summary = batch_summary(self._batch_color_results, self._batch_color_failures, cancelled)
+        message = (f"总数: {len(self._batch_color_worker._items)}\n成功: {summary['success']}\n"
+                   f"测温器干扰: {summary['thermometer']}\n需复核: {summary['needs_review']}\n"
+                   f"失败: {summary['failed']}\n取消: {'是' if cancelled else '否'}\n\n"
+                   f"颜色→鼠号映射: {self._color_mapping_store.summary()}")
+        QMessageBox.information(self, "颜色识别批处理汇总", message)
         self._statusbar.showMessage("全部事件颜色识别已取消；已完成结果已保留。" if cancelled else "全部事件颜色识别完成。")
+
+    def _on_manage_color_mapping(self):
+        """Minimal user-facing mapping management without exposing its JSON file."""
+        box = QMessageBox(self)
+        box.setWindowTitle("颜色-鼠号映射")
+        box.setText(f"当前映射（持久保存）:\n{self._color_mapping_store.summary()}")
+        reset = box.addButton("重置全部映射", QMessageBox.DestructiveRole)
+        box.addButton("关闭", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is reset:
+            if self._color_mapping_store.reset():
+                QMessageBox.information(self, "颜色-鼠号映射", "全部颜色-鼠号映射已重置。")
+            else:
+                QMessageBox.warning(self, "颜色-鼠号映射", "映射无法保存；未重置。")
 
     def _on_color_error(self, progress, error_msg):
         progress.close()

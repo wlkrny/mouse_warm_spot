@@ -45,6 +45,9 @@ class DetectionEngine:
         # This replaces cross-episode time-gap merging: only Core occupancy
         # continuity may determine a clip boundary.
         "core_gap_tolerance_seconds": 0.3,
+        # Below this score, Core is empty even if a custom/stale occupied flag
+        # says otherwise. It is deliberately below the release threshold.
+        "core_empty_occupancy_threshold": 0.04,
         "min_event_duration_seconds": 0.8,
         "merge_gap_seconds": 0.8,
         "review_padding_seconds": 1.0,
@@ -98,6 +101,7 @@ class DetectionEngine:
         p = dict(self.DEFAULT_PARAMS)
         if params:
             p.update(params)
+        self._normalize_core_empty_params(p)
 
         total_frames = int(cap.get(7))
         fps = cap.get(5)
@@ -163,6 +167,20 @@ class DetectionEngine:
 
         return events
 
+    @classmethod
+    def _normalize_core_empty_params(cls, params: dict) -> None:
+        """Clamp bad Core-gap options instead of letting user config abort detection."""
+        try:
+            params["core_gap_tolerance_seconds"] = max(0.0, float(params["core_gap_tolerance_seconds"]))
+        except (TypeError, ValueError):
+            params["core_gap_tolerance_seconds"] = cls.DEFAULT_PARAMS["core_gap_tolerance_seconds"]
+        try:
+            params["core_empty_occupancy_threshold"] = min(1.0, max(
+                0.0, float(params["core_empty_occupancy_threshold"])
+            ))
+        except (TypeError, ValueError):
+            params["core_empty_occupancy_threshold"] = cls.DEFAULT_PARAMS["core_empty_occupancy_threshold"]
+
     # ------------------------------------------------------------------
     # 两层检测: 占据大事件 + 计数子片段 (改进.md)
     # ------------------------------------------------------------------
@@ -191,6 +209,7 @@ class DetectionEngine:
         p = dict(self.DEFAULT_PARAMS)
         if params:
             p.update(params)
+        self._normalize_core_empty_params(p)
 
         roi_core = roi_data["roi_core"]
         roi_count = roi_data.get("roi_count")
@@ -519,6 +538,8 @@ class DetectionEngine:
                 "identity_needs_review": False,
                 "identity_conflict": False,
                 "identity_method": "not_applicable_core_empty_gap",
+                "core_empty_reason": previous.get("core_empty_reason", "not_occupied"),
+                "core_empty_occupancy": previous.get("core_empty_occupancy", {}),
             })
         return result
 
@@ -864,6 +885,8 @@ class DetectionEngine:
         state = self.IDLE
         on_counter = 0          # 连续满足进入条件的帧数
         off_counter = 0         # 连续满足离开条件的帧数
+        empty_ratios = []       # qualifying Core-empty occupancy scores
+        empty_reasons = []
         event_start = -1        # 当前事件开始帧
         current_occ_ratios = [] # 当前事件的遮挡比例记录
 
@@ -886,7 +909,13 @@ class DetectionEngine:
             last_frame_read = global_frame
 
             metrics = self._metrics.compute(frame, roi_core, background_bgr)
-            occ_ratio = metrics.get("occlusion_area_ratio", 0.0)
+            occ_ratio = float(metrics.get("occlusion_area_ratio", 0.0))
+            # Native DetectionMetrics uses score >= 0.20 for occupation. A
+            # score below the explicit empty threshold wins over stale flags.
+            is_occupied = bool(metrics.get("is_occupied", occ_ratio >= occupy_threshold))
+            low_occupancy = occ_ratio < params["core_empty_occupancy_threshold"]
+            core_empty = (not is_occupied) or low_occupancy
+            core_empty_reason = "low_occupancy" if low_occupancy else "not_occupied"
             dark_ratio = metrics.get("dark_pixel_ratio", 0.0)
             bg_diff_score = metrics.get("background_diff_score", 0.0)
 
@@ -919,9 +948,11 @@ class DetectionEngine:
                 current_occ_ratios.append(occ_ratio)
                 current_dark_ratios.append(dark_ratio)
                 current_bg_diff_scores.append(bg_diff_score)
-                if occ_ratio <= release_threshold:
+                if core_empty:
                     state = self.CANDIDATE_OFF
                     off_counter = 1
+                    empty_ratios = [occ_ratio]
+                    empty_reasons = [core_empty_reason]
                 else:
                     off_counter = 0
 
@@ -929,12 +960,17 @@ class DetectionEngine:
                 current_occ_ratios.append(occ_ratio)
                 current_dark_ratios.append(dark_ratio)
                 current_bg_diff_scores.append(bg_diff_score)
-                if occ_ratio >= occupy_threshold:
-                    # 遮挡再次升高, 回到 OCCUPIED (规范 13: CANDIDATE_OFF → OCCUPIED)
+                if not core_empty:
+                    # Intermediate but non-empty scores cancel a gap, avoiding
+                    # splits caused by normal near-threshold score noise.
                     state = self.OCCUPIED
                     off_counter = 0
-                elif occ_ratio <= release_threshold:
+                    empty_ratios = []
+                    empty_reasons = []
+                else:
                     off_counter += 1
+                    empty_ratios.append(occ_ratio)
+                    empty_reasons.append(core_empty_reason)
                     if off_counter >= core_gap_frames:
                         # Core has been empty for the configured tolerance.
                         # End on the last Core-occupied frame; ROI Count is not
@@ -968,6 +1004,13 @@ class DetectionEngine:
                                 "bg_diff_max": float(max_bg),
                                 "end_reason": "core_gap",
                                 "core_gap_frames": off_counter,
+                                "core_empty_reason": ("low_occupancy" if "low_occupancy" in empty_reasons else "not_occupied"),
+                                "core_empty_occupancy": {
+                                    "min": float(min(empty_ratios)) if empty_ratios else 0.0,
+                                    "max": float(max(empty_ratios)) if empty_ratios else 0.0,
+                                    "mean": float(np.mean(empty_ratios)) if empty_ratios else 0.0,
+                                    "threshold": float(params["core_empty_occupancy_threshold"]),
+                                },
                             })
 
                         on_counter = 0
@@ -975,11 +1018,9 @@ class DetectionEngine:
                         current_occ_ratios = []
                         current_dark_ratios = []
                         current_bg_diff_scores = []
+                        empty_ratios = []
+                        empty_reasons = []
                         event_start = -1
-                else:
-                    # 中间区域 (release < occ < occupy): 遮挡未真正离开也未重新进入
-                    # 重置计数器, 避免累积误判提前结束事件 (规范 13.2)
-                    off_counter = 0
 
         # 如果扫描结束时仍处于 OCCUPIED/CANDIDATE 状态, 收尾
         if state in (self.OCCUPIED, self.CANDIDATE_OFF) and event_start >= 0:

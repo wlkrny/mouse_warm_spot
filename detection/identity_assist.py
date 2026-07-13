@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .models.classifier import hsv_rule_classify
+from .color_mouse_mapping import ColorMouseMappingStore
 
 logger = logging.getLogger(__name__)
 
@@ -999,7 +1000,11 @@ class IdentityAssist:
 # ------------------------------------------------------------------
 # Utility: apply result to a CountSegment dict (in-place)
 # ------------------------------------------------------------------
-def apply_identity_to_segment(segment: dict, id_result: dict) -> dict:
+def apply_identity_to_segment(
+    segment: dict,
+    id_result: dict,
+    mapping_store: ColorMouseMappingStore | None = None,
+) -> dict:
     """
     Apply IdentityAssist results to a CountSegment dict.
     Does NOT overwrite manually confirmed results.
@@ -1009,6 +1014,10 @@ def apply_identity_to_segment(segment: dict, id_result: dict) -> dict:
     :return: same segment (for chaining)
     """
     if segment.get("count_status") == "confirmed":
+        return segment
+
+    # A canonical Core-empty segment is never an identity candidate.
+    if segment.get("estimated_mouse_count") == 0 or id_result.get("target_count") == 0:
         return segment
 
     # Keep canonical automatic count in sync before GUI/CSV consumers inspect it.
@@ -1025,7 +1034,27 @@ def apply_identity_to_segment(segment: dict, id_result: dict) -> dict:
                                                   segment.get("identity_conflict", False))
     segment["identity_method"] = id_result["identity_method"]
 
-    id_note = id_result.get("identity_note", "")
+    # Only complete, unique known-color results receive a durable automatic ID.
+    # Unknown/repeated/conflicting two-mouse evidence remains explicitly reviewable.
+    colors = segment["auto_mouse_colors"]
+    target_count = segment.get("estimated_mouse_count")
+    if (not id_result.get("thermometer_present") and not segment.get("identity_conflict")
+            and not segment.get("identity_needs_review") and target_count in (1, 2)
+            and len(colors) == target_count):
+        assigned = mapping_store.assign_colors(colors) if mapping_store is not None else None
+        if assigned is not None:
+            segment["mouse_ids"] = assigned
+            segment["mouse_count"] = len(assigned)
+            segment["auto_mouse_ids"] = [str(mouse_id) for mouse_id in assigned]
+            segment["auto_mouse_mapping"] = {
+                color: mouse_id for color, mouse_id in zip(colors, assigned)
+            }
+        else:
+            segment["identity_needs_review"] = True
+            segment["needs_review"] = True
+            segment["identity_note"] = "颜色到鼠号映射冲突、未知或不可写，请人工复核"
+
+    id_note = segment.get("identity_note", id_result.get("identity_note", ""))
     if id_note:
         old = segment.get("note", "")
         segment["note"] = f"{old}; {id_note}" if old else id_note

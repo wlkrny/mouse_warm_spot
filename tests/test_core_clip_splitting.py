@@ -29,16 +29,20 @@ class FakeCapture:
 
 
 class SequenceMetrics:
-    def __init__(self, core_occupied, count_occupied=None):
+    def __init__(self, core_occupied, count_occupied=None, core_scores=None):
         self.core_occupied = core_occupied
         self.count_occupied = count_occupied or core_occupied
+        self.core_scores = core_scores
 
     def compute(self, frame, roi, background):
         index = int(frame[0, 0, 0])
         occupied = (self.core_occupied if roi["name"] == "core"
                     else self.count_occupied)[index]
+        score = (self.core_scores[index] if roi["name"] == "core" and self.core_scores
+                 else (0.3 if occupied else 0.0))
         return {
-            "occlusion_area_ratio": 0.3 if occupied else 0.0,
+            "occlusion_area_ratio": score,
+            "is_occupied": occupied,
             "dark_pixel_ratio": 0.0,
             "background_diff_score": 0.0,
         }
@@ -55,8 +59,8 @@ class ZeroCounter:
         return None
 
 
-def _engine(core, count=None):
-    return DetectionEngine(SequenceMetrics(core, count))
+def _engine(core, count=None, scores=None):
+    return DetectionEngine(SequenceMetrics(core, count, scores))
 
 
 def _params(**extra):
@@ -80,9 +84,9 @@ def _roi():
     }
 
 
-def _fine_events(core, count=None, **params):
+def _fine_events(core, count=None, scores=None, **params):
     cap = FakeCapture(len(core))
-    return _engine(core, count)._fine_scan(
+    return _engine(core, count, scores)._fine_scan(
         cap, 0, len(core) - 1, 10.0, _roi(), None, _params(**params)
     )
 
@@ -102,6 +106,40 @@ def test_core_gap_at_tolerance_splits_clips():
 def test_core_gap_shorter_than_tolerance_does_not_split():
     events = _fine_events([True] * 5 + [False] * 2 + [True] * 5)
     assert [(e["start_frame"], e["end_frame"]) for e in events] == [(0, 11)]
+
+
+def test_low_occupancy_with_stale_occupied_flag_splits_and_records_reason():
+    core = [True] * 5 + [True] * 3 + [True] * 5
+    scores = [0.3] * 5 + [0.02] * 3 + [0.3] * 5
+    events = _fine_events(core, scores=scores)
+    assert [(e["start_frame"], e["end_frame"]) for e in events] == [(0, 4), (8, 12)]
+    assert events[0]["core_empty_reason"] == "low_occupancy"
+    assert events[0]["core_empty_occupancy"] == {
+        "min": 0.02, "max": 0.02, "mean": 0.02, "threshold": 0.04,
+    }
+
+
+def test_score_above_empty_threshold_does_not_split_when_occupied():
+    core = [True] * 13
+    scores = [0.3] * 5 + [0.06] * 3 + [0.3] * 5
+    events = _fine_events(core, scores=scores)
+    assert [(e["start_frame"], e["end_frame"]) for e in events] == [(0, 12)]
+
+
+def test_core_empty_parameter_clamps_invalid_values():
+    params = {"core_gap_tolerance_seconds": "bad", "core_empty_occupancy_threshold": 9}
+    DetectionEngine._normalize_core_empty_params(params)
+    assert params == {"core_gap_tolerance_seconds": 0.3, "core_empty_occupancy_threshold": 1.0}
+
+
+def test_low_occupancy_gap_generates_zero_segment_with_debug_fields():
+    core = [True] * 5 + [True] * 3 + [True] * 5
+    scores = [0.3] * 5 + [0.02] * 3 + [0.3] * 5
+    engine = _engine(core, [True] * len(core), scores)
+    _, segments = engine.detect_with_counting(FakeCapture(len(core)), _roi(), None, _params(), counter=ZeroCounter())
+    gap = next(segment for segment in segments if segment.get("start_reason") == "core_empty_gap")
+    assert gap["core_empty_reason"] == "low_occupancy"
+    assert gap["core_empty_occupancy"]["mean"] == 0.02
 
 
 def test_count_roi_activity_cannot_keep_core_clip_open():
