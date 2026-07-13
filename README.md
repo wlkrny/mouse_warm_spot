@@ -92,29 +92,29 @@ pip install -r requirements-ai.txt
 | `MOUSE_COLOR_BATCH_CONCURRENCY` | 批量颜色识别并发数上限（1=串行, 2=默认, 最大4；非法值自动回退2） | `2` |
 | `MOUSE_COLOR_AI_SAVE_DEBUG` | `1`=保存每次 VLM 请求的 context crop / response / manifest 到 `debug_vision_output/<clip_id>/` | 不保存 |
 
-### Kimi (Moonshot) 所需环境变量（全部必填）：
+### Kimi (Moonshot) 所需环境变量：
 
 | 环境变量 | 说明 |
 |---|---|
 | `KIMI_API_KEY` | API 密钥 |
-| `KIMI_API_BASE` | API 端点 URL（从 Moonshot 文档获取，不可猜测） |
-| `KIMI_VISION_MODEL` | 视觉模型名（须为支持视觉的模型，不可猜测） |
+| `KIMI_API_BASE` | API 端点 URL |
+| `KIMI_VISION_MODEL` | 视觉模型名 |
 
-**MiniMax** 所需环境变量（全部必填）：
+**MiniMax** 所需环境变量：
 
 | 环境变量 | 说明 |
 |---|---|
 | `MINIMAX_API_KEY` | API 密钥 |
-| `MINIMAX_API_BASE` | API 端点 URL（从 MiniMax 文档获取，不可猜测） |
-| `MINIMAX_VISION_MODEL` | 视觉模型名（须为支持视觉的模型，不可猜测） |
+| `MINIMAX_API_BASE` | API 端点 URL |
+| `MINIMAX_VISION_MODEL` | 视觉模型名 |
 
-**OpenRouter** 所需环境变量（全部必填；用户须确认所选模型具备 image input 能力）：
+**OpenRouter** 所需环境变量：
 
 | 环境变量 | 说明 |
 |---|---|
 | `OPENROUTER_API_KEY` | API 密钥 |
-| `OPENROUTER_API_BASE` | API 端点 URL（从 OpenRouter 文档获取） |
-| `OPENROUTER_VISION_MODEL` | 视觉模型名（如 `<vision-capable-model-id>`，须支持视觉输入） |
+| `OPENROUTER_API_BASE` | API 端点 URL |
+| `OPENROUTER_VISION_MODEL` | 视觉模型名 |
 
 **配置方式**：
 
