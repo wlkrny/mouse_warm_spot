@@ -1,0 +1,6 @@
+# 可选 AI 推理依赖
+# 安装: pip install -r requirements-ai.txt
+# 仅当需要 ONNX 耳标颜色 CNN 分类器 或 AI 视觉模型 (Kimi/Minimax) 时才需安装
+# 不安装时程序自动回退到 HSV 规则分类，功能完全正常
+onnxruntime>=1.15.0
+requests>=2.28.0

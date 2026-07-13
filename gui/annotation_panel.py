@@ -90,7 +90,7 @@ class AnnotationPanel(QWidget):
         layout.addWidget(self._sep())
 
         # ---- 数量确认区 (改进.md 11.3, 13 节; cap=2) ----
-        lbl_count = QLabel("确认数量 (Ctrl+1~2):")
+        lbl_count = QLabel("确认数量 (Shift+1~2):")
         lbl_count.setStyleSheet("color: #aaa; font-size: 10px;")
         layout.addWidget(lbl_count)
 
@@ -101,7 +101,7 @@ class AnnotationPanel(QWidget):
             btn.setCheckable(False)
             btn.setMinimumHeight(30)
             btn.setFont(QFont("Microsoft YaHei", 10))
-            btn.setToolTip(f"确认数量为 {c} 只 (Ctrl+{c})")
+            btn.setToolTip(f"确认数量为 {c} 只 (Shift+{c})")
             btn.clicked.connect(lambda checked, cnt=c: self._on_count_confirm(cnt))
             btn.setStyleSheet(self._count_btn_style())
             self._count_buttons[c] = btn
@@ -311,8 +311,12 @@ class AnnotationPanel(QWidget):
                 self._lbl_id_conf.setText(f"识别置信度: {id_conf:.2f} (低)")
                 self._lbl_id_conf.setStyleSheet("color: #ff6644; font-size: 10px;")
         else:
-            self._lbl_id_conf.setText("识别置信度: --")
-            self._lbl_id_conf.setStyleSheet("color: #aaa; font-size: 10px;")
+            if "thermometer_detected" in id_method:
+                self._lbl_id_conf.setText("识别置信度: 0.00 (测温器干扰)")
+                self._lbl_id_conf.setStyleSheet("color: #ff6644; font-size: 10px;")
+            else:
+                self._lbl_id_conf.setText("识别置信度: --")
+                self._lbl_id_conf.setStyleSheet("color: #aaa; font-size: 10px;")
 
         if id_method:
             self._lbl_id_method.setText(f"识别方法: {id_method}")
@@ -327,7 +331,7 @@ class AnnotationPanel(QWidget):
             self._lbl_id_conflict.setVisible(False)
 
         if id_needs_review:
-            self._lbl_id_review.setText("[!] 建议人工审核")
+            self._lbl_id_review.setText("[!] 检测到测温器/探头，请人工复核" if "thermometer_detected" in id_method else "[!] 建议人工审核")
             self._lbl_id_review.setVisible(True)
         else:
             self._lbl_id_review.setText("")
@@ -410,7 +414,7 @@ class AnnotationPanel(QWidget):
             self.review_action.emit("reject", self._current_event_idx)
 
     def _on_count_confirm(self, count: int):
-        """确认数量 (Ctrl+1~4) (改进.md 11.3 节)"""
+        """确认数量 (Shift+1~2) (改进.md 11.3 节)"""
         if self._current_event_idx >= 0:
             self.count_confirmed.emit(self._current_event_idx, count)
 

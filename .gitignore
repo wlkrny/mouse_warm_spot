@@ -24,9 +24,22 @@ env/
 .DS_Store
 Thumbs.db
 
+# Environment
+.env
+.env.*
+
 # Project specific
 *.mp4
 *.avi
 *.mov
 *.mkv
 output/
+
+# Backups (legacy color-recognition snapshots)
+backups/
+
+# Debug vision output (VLM context crops & API responses)
+debug_vision_output/
+
+# ONNX model weights (optional AI classifier)
+detection/models/*.onnx

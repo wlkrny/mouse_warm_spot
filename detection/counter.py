@@ -107,7 +107,14 @@ class MouseCounter:
 
         no_bg = background_bgr is None
         if not no_bg:
-            bg_crop = background_bgr[y1:y2, x1:x2]
+            bh, bw = background_bgr.shape[:2]
+            if y2 > bh or x2 > bw or y1 >= bh or x1 >= bw:
+                # 背景帧尺寸小于坐标范围，回退到 dark-only
+                no_bg = True
+            else:
+                bg_crop = background_bgr[y1:y2, x1:x2]
+                if bg_crop.size == 0:
+                    no_bg = True
 
         # ---- 2. 创建椭圆 mask ----
         cx_crop = crop_w / 2.0

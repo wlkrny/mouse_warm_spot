@@ -297,13 +297,15 @@ class EventListWidget(QWidget):
         # 工具提示: 显示额外标记
         tooltip_parts = []
         if seg.get("needs_review"):
-            tooltip_parts.append("⚠ 需审核")
+            tooltip_parts.append("需审核")
+        if "thermometer_detected" in seg.get("identity_method", ""):
+            tooltip_parts.append("检测到测温器/探头：身份置信度已置零")
         if seg.get("identity_conflict"):
-            tooltip_parts.append("❌ 身份冲突")
+            tooltip_parts.append("身份冲突")
         if seg.get("is_possible_false_positive"):
-            tooltip_parts.append("🔍 可能误检")
+            tooltip_parts.append("可能误检")
         if seg.get("is_short_event"):
-            tooltip_parts.append("⏱ 短事件")
+            tooltip_parts.append("短事件")
         tooltip = "\n".join(tooltip_parts) if tooltip_parts else ""
 
         # ID
@@ -373,14 +375,10 @@ class EventListWidget(QWidget):
         # 状态 — Phase 6: 使用 row_color 统一显示
         count_status = seg.get("count_status")
         display_status = seg.get("count_status", seg.get("status", "pending"))
-        status_text = self.STATUS_LABELS.get(display_status, display_status)
-        # 额外标签
-        if seg.get("needs_review"):
-            status_text += " ⚠"
-        if seg.get("identity_conflict"):
-            status_text += " ❌"
-        if seg.get("is_possible_false_positive"):
-            status_text += " 🔍"
+        if display_status in ("confirmed", "rejected"):
+            status_text = "已审核"
+        else:
+            status_text = "未审核"
         status_item = QTableWidgetItem(status_text)
         status_item.setTextAlignment(Qt.AlignCenter)
         status_item.setForeground(QBrush(color))

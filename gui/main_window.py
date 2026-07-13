@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QLineEdit, QStatusBar,
     QFileDialog, QMessageBox, QDockWidget, QToolBar, QMenuBar, QMenu,
-    QApplication, QSplitter, QSizePolicy, QProgressBar, QProgressDialog, QInputDialog,
+    QApplication, QSplitter, QSizePolicy, QProgressBar, QProgressDialog, QInputDialog, QScrollArea,
 )
 
 from .video_widget import VideoWidget
@@ -151,9 +151,10 @@ class ColorIdentifyWorker(QThread):
             if self._cancelled:
                 return
             assist = IdentityAssist(debug=True)
-            result = assist.detect_ear_tags(
+            result = assist.analyze_segment(
                 segment=self.segment, roi_core=self.roi_core,
-                cap=cap, fps=self.fps
+                cap=cap, fps=self.fps,
+                progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
             )
             self.finished.emit(result)
         except Exception as e:
@@ -166,6 +167,55 @@ class ColorIdentifyWorker(QThread):
 # =========================================================================
 # 主窗口
 # =========================================================================
+class BatchColorIdentifyWorker(QThread):
+    """串行识别多个 segment；所有界面更新由主线程的 slot 完成。"""
+    item_started = Signal(int, int, int)  # index, ordinal, total
+    item_progress = Signal(int, int, int, str)  # index, ordinal, percent, message
+    item_finished = Signal(int, dict)
+    item_error = Signal(int, str)
+    finished_batch = Signal(bool)
+
+    def __init__(self, items, roi_core, video_path, fps, parent=None):
+        super().__init__(parent)
+        self._items = items
+        self._roi_core = roi_core
+        self._video_path = video_path
+        self._fps = fps
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(self._video_path)
+            if not cap.isOpened():
+                self.item_error.emit(-1, f"无法打开视频: {self._video_path}")
+                return
+            total = len(self._items)
+            for ordinal, (index, segment) in enumerate(self._items, 1):
+                if self._cancelled:
+                    break
+                self.item_started.emit(index, ordinal, total)
+                try:
+                    result = IdentityAssist(debug=True).analyze_segment(
+                        segment=segment, roi_core=self._roi_core, cap=cap, fps=self._fps,
+                        progress_callback=lambda pct, msg, i=index, o=ordinal:
+                            self.item_progress.emit(i, o, pct, msg),
+                    )
+                    if not self._cancelled:
+                        self.item_finished.emit(index, result)
+                except Exception as exc:
+                    self.item_error.emit(index, str(exc))
+            self.finished_batch.emit(self._cancelled)
+        except Exception as exc:
+            self.item_error.emit(-1, str(exc))
+        finally:
+            if cap is not None:
+                cap.release()
+
+
 class MainWindow(QMainWindow):
     """主窗口 — 完整检测+审核工作流"""
 
@@ -189,7 +239,10 @@ class MainWindow(QMainWindow):
         self._episodes: list[dict] = []     # 占据大事件 (改进.md)
         self._count_segments: list[dict] = []  # 计数子片段 (改进.md)
 
-        # 身份识别线程
+        # 身份识别线程（单项或串行批量，避免并发云请求）
+        self._color_worker = None
+        self._batch_color_worker = None
+        self._batch_color_progress = None
 
         # 校准标记系统 (Phase 1+2: CalibrationStore 接管)
         self._calib_store = CalibrationStore()
@@ -266,6 +319,17 @@ class MainWindow(QMainWindow):
         export_csv_action.setShortcut(QKeySequence("Ctrl+E"))
         export_csv_action.triggered.connect(self._on_export_csv)
         file_menu.addAction(export_csv_action)
+
+        file_menu.addSeparator()
+
+        save_project_action = QAction("保存项目(&P)...", self)
+        save_project_action.setShortcut(QKeySequence("Ctrl+S"))
+        save_project_action.triggered.connect(self._on_save_project)
+        file_menu.addAction(save_project_action)
+
+        load_project_action = QAction("加载项目(&J)...", self)
+        load_project_action.triggered.connect(self._on_load_project)
+        file_menu.addAction(load_project_action)
 
         file_menu.addSeparator()
 
@@ -381,9 +445,9 @@ class MainWindow(QMainWindow):
         )
         toolbar.addWidget(self._btn_detect)
 
-        # 颜色识别 (对当前选中片段运行耳标颜色识别)
+        # 颜色识别（可选择当前事件或全部事件）
         self._btn_color = QPushButton("颜色识别")
-        self._btn_color.setToolTip("对当前选中片段运行耳标颜色识别")
+        self._btn_color.setToolTip("识别当前事件或串行识别全部事件")
         self._btn_color.clicked.connect(self._on_color_identify)
         self._btn_color.setMinimumHeight(30)
         self._btn_color.setEnabled(False)
@@ -461,24 +525,42 @@ class MainWindow(QMainWindow):
     # 右侧停靠窗口: 放大窗口 + 指标面板 + 标注面板
     # ==================================================================
     def _setup_docks(self):
+        # 暗色滚动区域样式
+        scroll_style = (
+            "QScrollArea { background-color: #2a2a2a; border: none; }"
+            "QScrollArea > QWidget > QWidget { background-color: #2a2a2a; }"
+        )
+
         # 暖点放大窗口
         self._zoom_widget = ZoomWidget()
+        zoom_scroll = QScrollArea()
+        zoom_scroll.setWidgetResizable(True)
+        zoom_scroll.setWidget(self._zoom_widget)
+        zoom_scroll.setStyleSheet(scroll_style)
         self._zoom_dock = QDockWidget("暖点放大", self)
-        self._zoom_dock.setWidget(self._zoom_widget)
+        self._zoom_dock.setWidget(zoom_scroll)
         self._zoom_dock.setMinimumWidth(250)
         self.addDockWidget(Qt.RightDockWidgetArea, self._zoom_dock)
 
         # 检测指标面板
         self._metrics_panel = MetricsPanel()
+        metrics_scroll = QScrollArea()
+        metrics_scroll.setWidgetResizable(True)
+        metrics_scroll.setWidget(self._metrics_panel)
+        metrics_scroll.setStyleSheet(scroll_style)
         self._metrics_dock = QDockWidget("检测指标", self)
-        self._metrics_dock.setWidget(self._metrics_panel)
+        self._metrics_dock.setWidget(metrics_scroll)
         self._metrics_dock.setMinimumWidth(280)
         self.addDockWidget(Qt.RightDockWidgetArea, self._metrics_dock)
 
         # 标注面板
         self._annotation_panel = AnnotationPanel()
+        annot_scroll = QScrollArea()
+        annot_scroll.setWidgetResizable(True)
+        annot_scroll.setWidget(self._annotation_panel)
+        annot_scroll.setStyleSheet(scroll_style)
         self._annotation_dock = QDockWidget("标注面板", self)
-        self._annotation_dock.setWidget(self._annotation_panel)
+        self._annotation_dock.setWidget(annot_scroll)
         self._annotation_dock.setMinimumWidth(260)
         self.addDockWidget(Qt.RightDockWidgetArea, self._annotation_dock)
 
@@ -974,6 +1056,164 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "错误", "无法读取背景帧图像")
 
+    def _on_save_project(self):
+        """保存项目状态到 .mwp.json 文件"""
+        import json
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存项目", "", "项目文件 (*.mwp.json)"
+        )
+        if not path:
+            return
+
+        try:
+            # --- 收集数据 ---
+            video_path = self._video_widget.video_path
+
+            # ROI 数据 (get_roi_data 返回 dict, 已可直接序列化)
+            roi_data = self._video_widget.get_roi_data()
+
+            # 校准样本 (不保存 frame_bgr)
+            calibration = []
+            for count in range(3):
+                for sample in self._calib_store.get_samples(count):
+                    calibration.append({
+                        "mouse_count": sample.mouse_count,
+                        "frame_idx": sample.frame_idx,
+                    })
+
+            # 事件/片段 (转换内部 numpy 值)
+            segments = self._event_list.get_segments()
+            serializable_segments = []
+            for seg in segments:
+                clean_seg = {}
+                for k, v in seg.items():
+                    if isinstance(v, np.ndarray):
+                        clean_seg[k] = v.tolist()
+                    elif isinstance(v, (np.integer,)):
+                        clean_seg[k] = int(v)
+                    elif isinstance(v, (np.floating,)):
+                        clean_seg[k] = float(v)
+                    elif isinstance(v, list):
+                        clean_seg[k] = [
+                            x.tolist() if isinstance(x, np.ndarray)
+                            else int(x) if isinstance(x, (np.integer,))
+                            else float(x) if isinstance(x, (np.floating,))
+                            else x
+                            for x in v
+                        ]
+                    else:
+                        clean_seg[k] = v
+                serializable_segments.append(clean_seg)
+
+            data = {
+                "version": 1,
+                "video_path": video_path or "",
+                "roi_data": roi_data,
+                "calibration": calibration,
+                "segments": serializable_segments,
+            }
+
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            self._statusbar.showMessage(f"项目已保存: {path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "保存错误", f"项目保存失败:\n{e}")
+
+    def _on_load_project(self):
+        """从 .mwp.json 文件加载项目状态"""
+        import json
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "加载项目", "", "项目文件 (*.mwp.json)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "加载错误", f"无法读取项目文件:\n{e}")
+            return
+
+        # 版本校验
+        version = data.get("version", 0)
+        if version > 1:
+            QMessageBox.warning(
+                self, "版本不兼容",
+                f"项目文件版本 {version} 高于当前支持版本 1，可能无法正确加载。"
+            )
+
+        try:
+            # --- 恢复视频 ---
+            video_path = data.get("video_path", "")
+            video_opened = False
+            if video_path and os.path.exists(video_path):
+                video_opened = self._video_widget.open_video(video_path)
+                if not video_opened:
+                    self._statusbar.showMessage(f"警告: 无法打开视频 {video_path}")
+            elif video_path:
+                self._statusbar.showMessage(f"警告: 视频文件不存在 {video_path}")
+
+            # --- 恢复 ROI ---
+            roi_data = data.get("roi_data")
+            if roi_data:
+                if "roi_core" in roi_data and roi_data["roi_core"]:
+                    self._video_widget.roi_core = roi_data["roi_core"]
+                if "roi_count" in roi_data and roi_data["roi_count"]:
+                    self._video_widget.roi_count = roi_data["roi_count"]
+                self._video_widget.roi_changed.emit(
+                    self._video_widget.roi_core
+                )
+                self._video_widget.update()
+
+            # --- 恢复校准样本 (无 frame_bgr, 标记 invalid) ---
+            calib_data = data.get("calibration", [])
+            if calib_data:
+                # 清空现有校准数据
+                for count in range(3):
+                    self._calib_store.clear_samples(count)
+                self._video_widget._calibrated_frames.clear()
+                self._video_widget._calibrated_frame_idx.clear()
+
+                for entry in calib_data:
+                    sample = CalibrationSample(
+                        mouse_count=entry["mouse_count"],
+                        frame_idx=entry["frame_idx"],
+                        frame_bgr=np.zeros((1, 1, 3), dtype=np.uint8),
+                    )
+                    sample.valid = False
+                    sample.reason = "loaded_without_frame"
+                    self._calib_store.add_sample(sample)
+
+                    # 同步背景帧引用
+                    if entry["mouse_count"] == 0:
+                        self._video_widget._calibrated_frame_idx[0] = entry["frame_idx"]
+
+            # --- 恢复事件/片段 ---
+            segments = data.get("segments", [])
+            if segments:
+                self._events = segments
+                self._count_segments = segments
+                self._event_list.clear()
+                self._event_list.set_events(segments)
+                if segments:
+                    self._event_list.select_row(0)
+
+            self._update_controls_state()
+            self._update_frame_info_label()
+            self._update_calib_button_labels()
+            self._statusbar.showMessage(
+                f"项目已加载: {path}"
+                + (" | 校准样本需重新标记背景后重测" if calib_data else "")
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "加载错误", f"项目加载失败:\n{e}")
+
     def _on_slider_changed(self, value: int):
         """滑块拖动"""
         if self._video_widget._cap is not None:
@@ -1004,11 +1244,11 @@ class MainWindow(QMainWindow):
             self._video_widget.next_frame()
             return
 
-        # A/D ±10 帧 -> J/L 快退/进 (Phase 6: 重映射)
-        if key == Qt.Key_A:
+        # ↑↓ 上下箭头: 跳转上一个/下一个事件并自动播放
+        if key == Qt.Key_Up:
             self._goto_prev_event()
             return
-        if key == Qt.Key_D:
+        if key == Qt.Key_Down:
             self._goto_next_event()
             return
 
@@ -1054,8 +1294,8 @@ class MainWindow(QMainWindow):
             self._annotation_panel._on_mouse_toggle(4)
             return
 
-        # Ctrl+1/2: 确认数量 (改进.md 13 节; cap=2)
-        if event.modifiers() == Qt.ControlModifier:
+        # Shift+1/2: 确认数量 (改进.md 13 节; cap=2)
+        if event.modifiers() == Qt.ShiftModifier:
             if key == Qt.Key_1:
                 self._on_count_confirmed(self._current_review_idx, 1)
                 return
@@ -1098,7 +1338,7 @@ class MainWindow(QMainWindow):
     # ==================================================================
     @Slot(int, int)
     def _on_count_confirmed(self, event_idx: int, count: int):
-        """确认数量 (Ctrl+1~4)"""
+        """确认数量 (Shift+1~2)"""
         seg = self._event_list.get_segment(event_idx)
         if seg is None:
             return
@@ -1388,92 +1628,125 @@ class MainWindow(QMainWindow):
     # 颜色识别
     # ==================================================================
     def _on_color_identify(self):
-        """对当前选中片段运行颜色识别 (后台线程+QProgressDialog)"""
-        seg_idx = self._current_review_idx
-        if seg_idx < 0:
-            QMessageBox.information(self, "提示", "请先在事件列表中选择一个片段")
+        """选择当前事件或全部事件；批量路径严格串行。"""
+        if self._color_worker and self._color_worker.isRunning() or self._batch_color_worker and self._batch_color_worker.isRunning():
+            QMessageBox.information(self, "颜色识别", "颜色识别正在进行中")
             return
+        roi_data = self._video_widget.get_roi_data()
+        if roi_data is None or not self._video_widget.video_path:
+            QMessageBox.warning(self, "提示", "请先打开视频并绘制 ROI")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("颜色识别范围")
+        box.setText("请选择颜色识别范围：")
+        current = box.addButton("当前事件", QMessageBox.AcceptRole)
+        all_events = box.addButton("全部事件", QMessageBox.ActionRole)
+        cancel = box.addButton("取消", QMessageBox.RejectRole)
+        has_current = self._event_list.get_segment(self._current_review_idx) is not None
+        current.setEnabled(has_current)
+        if not has_current:
+            box.setInformativeText("未选中当前事件；仍可识别全部事件。")
+        box.exec()
+        if box.clickedButton() is current and has_current:
+            self._start_single_color_identify(self._current_review_idx, roi_data)
+        elif box.clickedButton() is all_events:
+            self._start_batch_color_identify(roi_data)
 
+    def _start_single_color_identify(self, seg_idx, roi_data):
         seg = self._event_list.get_segment(seg_idx)
         if not seg:
             return
-
-        roi_data = self._video_widget.get_roi_data()
-        if roi_data is None:
-            QMessageBox.warning(self, "提示", "请先绘制 ROI")
-            return
-
-        video_path = self._video_widget.video_path
-        fps = self._video_widget.fps
-        seg_id = seg.get("segment_id", "?")
-
-        progress = QProgressDialog(
-            f"颜色识别: 正在分析片段 #{seg_id}...", "取消", 0, 100, self
-        )
+        progress = QProgressDialog(f"颜色识别: 正在分析片段 #{seg.get('segment_id', '?')}...", "取消", 0, 100, self)
         progress.setWindowTitle("颜色识别")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
-        progress.setValue(0)
-
-        self._color_worker = ColorIdentifyWorker(
-            seg, roi_data["roi_core"], video_path, fps, self
-        )
-        self._color_worker.progress.connect(
-            lambda pct, msg: progress.setLabelText(f"{msg}") or progress.setValue(pct)
-        )
-        self._color_worker.finished.connect(
-            lambda result: self._on_color_finished(progress, seg, result)
-        )
-        self._color_worker.error.connect(
-            lambda err: self._on_color_error(progress, err)
-        )
-        progress.canceled.connect(lambda: self._color_worker.cancel())
+        self._color_worker = ColorIdentifyWorker(seg, roi_data["roi_core"], self._video_widget.video_path, self._video_widget.fps, self)
+        self._color_worker.progress.connect(lambda pct, msg: (progress.setLabelText(msg), progress.setValue(pct)))
+        self._color_worker.finished.connect(lambda result: self._on_color_finished(progress, seg_idx, result))
+        self._color_worker.error.connect(lambda err: self._on_color_error(progress, err))
+        progress.canceled.connect(self._color_worker.cancel)
         self._color_worker.start()
 
-    def _on_color_finished(self, progress, seg, result):
+    def _apply_color_result(self, index, result):
+        seg = self._event_list.get_segment(index)
+        if seg is None:
+            return
+        apply_identity_to_segment(seg, result)
+        self._event_list._update_row(index)
+        if index == self._current_review_idx:
+            self._annotation_panel.set_event(index, seg)
+        return seg
+
+    def _on_color_finished(self, progress, index, result):
+        """保留当前事件的人工颜色→鼠号确认；测温器结果直接安全写回。"""
         progress.close()
-        colors = result.get("auto_mouse_colors", [])
-        conf = result.get("identity_confidence", 0)
-        note = result.get("identity_note", "")
-
-        # 过滤掉 unknown
-        valid_colors = [c for c in colors if c != "unknown"]
-
+        seg = self._event_list.get_segment(index)
+        if seg is None:
+            return
+        if result.get("thermometer_present"):
+            self._apply_color_result(index, result)
+            QMessageBox.warning(self, "颜色识别", "检测到测温器/探头，颜色识别置信度已置零，请人工复核。")
+            self._statusbar.showMessage(f"颜色识别完成: 事件 #{seg.get('segment_id')}，置信度 0.00")
+            return
+        valid_colors = [c for c in result.get("auto_mouse_colors", []) if c != "unknown"]
         if not valid_colors:
             QMessageBox.information(self, "颜色识别", "未检测到有效耳标颜色。")
             return
-
-        # 为每种颜色弹窗让用户选择鼠号
         mouse_ids = []
         for color in valid_colors:
-            # 用 QInputDialog 获取鼠号 (1-4)
-            mid, ok = QInputDialog.getInt(
-                self, f"识别到 {color}",
-                f"检测到耳标颜色: {color}\n请选择对应的鼠号 (1-4):",
-                value=1, minValue=1, maxValue=4, step=1
-            )
+            mid, ok = QInputDialog.getInt(self, f"识别到 {color}",
+                                           f"检测到耳标颜色: {color}\n请选择对应的鼠号 (1-4):",
+                                           value=1, minValue=1, maxValue=4, step=1)
             if ok:
-                mouse_ids.append(str(mid))
-            else:
-                mouse_ids.append("")  # 取消=未知
-
-        # 应用到segment
+                mouse_ids.append(mid)
         if mouse_ids:
-            apply_identity_to_segment(seg, result)
-            seg["mouse_ids"] = [int(m) for m in mouse_ids if m]
-            seg["mouse_count"] = len(seg["mouse_ids"])
+            self._apply_color_result(index, result)
+            seg["mouse_ids"] = mouse_ids
+            seg["mouse_count"] = len(mouse_ids)
             seg["count_status"] = "confirmed"
+            self._event_list.update_segment_mouse_ids(index, mouse_ids)
+            self._event_list.update_segment_status(index, "confirmed")
+            if index == self._current_review_idx:
+                self._annotation_panel.set_event(index, seg)
+        self._statusbar.showMessage(f"颜色识别完成: 事件 #{seg.get('segment_id')}，置信度 {result.get('identity_confidence', 0):.2f}")
 
-            # 刷新事件列表显示
-            idx = self._current_review_idx
-            if idx >= 0:
-                self._event_list.update_segment_mouse_ids(idx, seg["mouse_ids"])
-                self._event_list.update_segment_status(idx, "confirmed")
-                self._annotation_panel.set_event(idx, seg)
+    def _start_batch_color_identify(self, roi_data):
+        items = [(i, seg) for i, seg in enumerate(self._event_list.get_segments())
+                 if seg.get("start_frame") is not None and seg.get("end_frame") is not None
+                 and seg["end_frame"] >= seg["start_frame"]]
+        if not items:
+            QMessageBox.information(self, "颜色识别", "没有可处理的非空事件。")
+            return
+        progress = QProgressDialog("颜色识别: 准备中...", "取消", 0, 100, self)
+        progress.setWindowTitle("全部事件颜色识别")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        self._batch_color_progress = progress
+        self._batch_color_worker = BatchColorIdentifyWorker(items, roi_data["roi_core"], self._video_widget.video_path, self._video_widget.fps, self)
+        self._batch_color_worker.item_started.connect(lambda idx, i, n: progress.setLabelText(f"当前 {i}/{n}: 事件 #{self._event_list.get_segment(idx).get('segment_id')}"))
+        self._batch_color_worker.item_progress.connect(lambda idx, i, pct, msg: (progress.setLabelText(f"当前 {i}/{len(items)}: 事件 #{self._event_list.get_segment(idx).get('segment_id')} — {msg}"), progress.setValue(pct)))
+        self._batch_color_worker.item_finished.connect(self._on_batch_color_finished)
+        self._batch_color_worker.item_error.connect(self._on_batch_color_error)
+        self._batch_color_worker.finished_batch.connect(self._on_batch_color_done)
+        progress.canceled.connect(self._batch_color_worker.cancel)
+        self._batch_color_worker.start()
 
-            self._statusbar.showMessage(
-                f"颜色识别完成: {color} → 鼠{' '.join([str(m) for m in seg['mouse_ids']])} (置信度 {conf:.2f})"
-            )
+    @Slot(int, dict)
+    def _on_batch_color_finished(self, index, result):
+        seg = self._apply_color_result(index, result)
+        if seg:
+            self._statusbar.showMessage(f"颜色识别完成: 事件 #{seg.get('segment_id')}，置信度 {result.get('identity_confidence', 0):.2f}")
+
+    @Slot(int, str)
+    def _on_batch_color_error(self, index, error_msg):
+        label = "视频" if index < 0 else f"事件 #{self._event_list.get_segment(index).get('segment_id')}"
+        self._statusbar.showMessage(f"颜色识别失败 ({label})，将继续: {error_msg.splitlines()[0]}")
+
+    @Slot(bool)
+    def _on_batch_color_done(self, cancelled):
+        if self._batch_color_progress:
+            self._batch_color_progress.close()
+        self._statusbar.showMessage("全部事件颜色识别已取消；已完成结果已保留。" if cancelled else "全部事件颜色识别完成。")
 
     def _on_color_error(self, progress, error_msg):
         progress.close()

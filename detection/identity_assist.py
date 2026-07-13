@@ -4,12 +4,18 @@
 提供耳标颜色候选 + 冲突处理 + A→B替换辅助 + 向后兼容
 """
 
+import os
 import cv2
 import numpy as np
 import logging
 import math
+import json
 from collections import defaultdict
 from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
+
+from .models.classifier import hsv_rule_classify
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +36,11 @@ class IdentityAssist:
     # ROI Search = Core × 2.8
     SEARCH_SCALE = 2.8
 
-    def __init__(self, debug: bool = False):
+    # AI 视觉请求预算：每个 segment 最多云视觉请求数（默认 3；0=禁用云视觉，仅 CNN/HSV）
+    # 通过 MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT 环境变量可配置
+    MAX_VISION_REQUESTS_PER_SEGMENT: int = 3
+
+    def __init__(self, debug: bool = False, color_model_path=None, use_cnn=None):
         self.debug = debug
         if debug:
             logger.setLevel(logging.DEBUG)
@@ -38,6 +48,41 @@ class IdentityAssist:
                 h = logging.StreamHandler()
                 h.setFormatter(logging.Formatter('%(asctime)s [%(name)s] %(message)s', datefmt='%H:%M:%S'))
                 logger.addHandler(h)
+
+        # ---- 可选 ONNX 分类器（懒加载，默认自动发现模型）----
+        self._color_model_path = color_model_path
+        self._use_cnn_flag = use_cnn
+        self._classifier = None  # 懒初始化
+
+        # 读取 AI 视觉请求预算
+        budget_str = os.environ.get("MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT", "3").strip()
+        try:
+            self._max_vision_requests = int(budget_str)
+        except ValueError:
+            logger.warning(
+                "Invalid MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT=%r; using default 3", budget_str
+            )
+            self._max_vision_requests = 3
+        if self._max_vision_requests < 0:
+            self._max_vision_requests = 0
+
+        # 每个 segment 的请求计数器（在 detect_ear_tags 入口重置）
+        self._vision_request_count: int = 0
+
+    def _get_classifier(self):
+        """懒获取 EarTagClassifier 单例。"""
+        if self._classifier is None:
+            # 环境变量优先级最低，由构造参数覆盖
+            if self._color_model_path is None:
+                env_path = os.environ.get("MOUSE_COLOR_MODEL_PATH", "").strip()
+                if env_path:
+                    self._color_model_path = env_path
+            from .models.classifier import EarTagClassifier
+            self._classifier = EarTagClassifier(
+                color_model_path=self._color_model_path,
+                use_cnn=self._use_cnn_flag,
+            )
+        return self._classifier
 
     # ------------------------------------------------------------------
     # analyze_segment: 统一入口 (带进度回调)
@@ -66,7 +111,8 @@ class IdentityAssist:
         """
         self._notify(progress_callback, 0, "颜色识别: 开始扫描帧...")
 
-        # 调用底层 detect_ear_tags
+        # 调用底层 detect_ear_tags（identity_method 由 detect_ear_tags 内部设置，
+        # 可能是 ear_tag_color_cnn|... 或 ear_tag_color_rule|...，此处不再覆盖）
         result = self.detect_ear_tags(
             segment=segment,
             roi_core=roi_core,
@@ -74,9 +120,6 @@ class IdentityAssist:
             fps=fps,
             background_bgr=background_bgr,
         )
-
-        # 统一 identity_method 为 "color_rule" 格式
-        result["identity_method"] = "color_rule"
 
         self._notify(progress_callback, 100, "颜色识别完成")
 
@@ -116,70 +159,64 @@ class IdentityAssist:
         逐像素颜色投票，返回多数颜色，加入主色优势判断。
         解决色相循环均值崩塌导致的红色→蓝色误判。
 
+        委托给 detection.models.classifier.hsv_rule_classify，
+        避免阈值逻辑重复。
+
         :param px: (N,3) HSV像素数组
         :return: (color, is_low_confidence, best_ratio)
-                 color: 'red'|'yellow'|'blue'|'green'|'white'|'unknown'
-                 is_low_confidence: True if secondary (relaxed) thresholds were used
-                 best_ratio: 主色占比 (0.0 if unknown)
         """
-        if len(px) == 0:
-            return "unknown", True, 0.0
+        return hsv_rule_classify(px)
 
-        h = px[:, 0]
-        s = px[:, 1]
-        v = px[:, 2]
+    # ------------------------------------------------------------------
+    # Context frame selection for VLM multi-frame input
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _select_context_frames(start_f: int, end_f: int) -> list[int]:
+        """为 VLM 上下文输入选择最多 9 帧（头三/中三/尾三，帧间隔 5）。
 
-        total_px = len(px)
+        头三帧：start, start+5, start+10
+        中间三帧：mid-5, mid, mid+5，其中 mid=(start+end)//2
+        结尾三帧：end-10, end-5, end
 
-        # Primary vote: tightened thresholds (same as classify_color)
-        red_mask    = ((h <= 12) | (h >= 165)) & (s > 45)
-        yellow_mask = (h >= 13) & (h <= 42) & (s > 45)
-        green_mask  = (h >= 48) & (h <= 80) & (s > 50)
-        blue_mask   = (h >= 90) & (h <= 135) & (s > 50)
-        white_mask  = (s < 35) & (v > 170)
+        所有候选 clamp 到 [start_f, end_f]，去重后按时间顺序排列。
+        足够长且不重叠的 segment 返回 9 帧；短 segment 因
+        clamp/去重可能少于 9，最低可至 1 帧（单帧 segment）。
+        """
+        mid_f = (start_f + end_f) // 2
+        candidates = [
+            start_f, start_f + 5, start_f + 10,
+            mid_f - 5, mid_f, mid_f + 5,
+            end_f - 10, end_f - 5, end_f,
+        ]
+        seen = set()
+        frames = []
+        for f in candidates:
+            f = max(start_f, min(end_f, f))
+            if f not in seen:
+                seen.add(f)
+                frames.append(f)
+        frames.sort()  # 保持时间顺序
+        return frames
 
-        counts = {
-            "red":    int(np.sum(red_mask)),
-            "yellow": int(np.sum(yellow_mask)),
-            "blue":   int(np.sum(blue_mask)),
-            "green":  int(np.sum(green_mask)),
-            "white":  int(np.sum(white_mask)),
-        }
+    @staticmethod
+    def _crop_context_frame(frame: np.ndarray, roi_core: dict,
+                            a_context: float, b_context: float) -> np.ndarray | None:
+        """裁剪上下文大范围图像（Search ROI × 1.5 外圈）。
 
-        best_color = max(counts, key=counts.get)
-        best_count = counts[best_color]
-        if best_count > 0:
-            best_ratio = best_count / max(1, total_px)
-            # Dominance gate: min_pixels≥3, ratio≥0.35, margin≥0.15
-            if best_count >= 3 and best_ratio >= 0.35:
-                sorted_counts = sorted(counts.values(), reverse=True)
-                second_best = sorted_counts[1] if len(sorted_counts) > 1 else 0
-                second_ratio = second_best / max(1, total_px)
-                if best_ratio - second_ratio >= 0.15:
-                    return best_color, False, best_ratio
+        以 ROI core 中心为中心，半轴为 a_context / b_context。
+        边界 clamp，绝不产生空 crop。
 
-        # Secondary fallback: relaxed thresholds for low-confidence detection
-        red_mask2    = ((h <= 12) | (h >= 165)) & (s > 35)
-        yellow_mask2 = (h >= 10) & (h <= 45) & (s > 35)
-        green_mask2  = (h >= 43) & (h <= 88) & (s > 35)
-        blue_mask2   = (h >= 85) & (h <= 140) & (s > 35)
-        white_mask2  = (s < 40) & (v > 160)
-
-        counts2 = {
-            "red":    int(np.sum(red_mask2)),
-            "yellow": int(np.sum(yellow_mask2)),
-            "blue":   int(np.sum(blue_mask2)),
-            "green":  int(np.sum(green_mask2)),
-            "white":  int(np.sum(white_mask2)),
-        }
-
-        best_color2 = max(counts2, key=counts2.get)
-        best_count2 = counts2[best_color2]
-        if best_count2 > 0:
-            best_ratio2 = best_count2 / max(1, total_px)
-            return best_color2, True, best_ratio2
-
-        return "unknown", True, 0.0
+        :returns: cropped BGR image, or None if frame is invalid
+        """
+        h, w = frame.shape[:2]
+        cx, cy = roi_core["cx"], roi_core["cy"]
+        x1 = max(0, int(cx - a_context))
+        y1 = max(0, int(cy - b_context))
+        x2 = min(w, int(cx + a_context))
+        y2 = min(h, int(cy + b_context))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return frame[y1:y2, x1:x2]
 
     # ------------------------------------------------------------------
     # Main detection
@@ -208,6 +245,13 @@ class IdentityAssist:
         end_f = segment["end_frame"]
         mid_f = (start_f + end_f) // 2
 
+        # ---- 每个 segment 重置 AI 视觉请求计数器 ----
+        self._vision_request_count = 0
+        budget = self._max_vision_requests
+        vision_enabled = budget > 0
+        if not vision_enabled:
+            logger.info("AI 视觉已禁用 (MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT=0)，仅使用 CNN/HSV 规则")
+
         # ---- ROI Search = Core × 2.8 ----
         roi_search = dict(roi_core)
         roi_search["a"] = roi_core["a"] * self.SEARCH_SCALE
@@ -217,7 +261,98 @@ class IdentityAssist:
         b_core = roi_core["b"]
         a_search = roi_search["a"]
         b_search = roi_search["b"]
+        a_context = a_search * 1.5  # VLM context crop 半轴
+        b_context = b_search * 1.5
         angle = roi_search.get("angle", 0.0)
+
+        # ---- VLM 上下文多帧请求（每 segment 仅一次）----
+        vlm_context_color: str | None = None
+        vlm_context_colors: list[str] | None = None
+        vlm_context_count: int | None = None
+        vlm_context_confidence: float = 0.0
+        vlm_thermometer_present = False
+        _vision_used_any = False
+        _vlm_context_raw_resp: dict | None = None
+
+        if vision_enabled:
+            clf_vlm = self._get_classifier()
+            if clf_vlm.is_vision_available:
+                # 1) 选择上下文帧
+                context_frame_ids = self._select_context_frames(start_f, end_f)
+                logger.info("VLM context frame selection: %d unique frames (start=%d mid=%d end=%d segment_len=%d)",
+                            len(context_frame_ids), start_f, mid_f, end_f, end_f - start_f + 1)
+
+                # 2) 读取并裁剪上下文帧
+                context_crops = []
+                valid_context_ids = []
+                for fid in context_frame_ids:
+                    cap.set(1, fid)
+                    ret, frame = cap.read()
+                    if not ret:
+                        continue
+                    crop = self._crop_context_frame(frame, roi_core, a_context, b_context)
+                    if crop is not None and crop.size > 0:
+                        context_crops.append(crop)
+                        valid_context_ids.append(fid)
+
+                # 3) 调用 VLM（消耗 1 次预算）
+                if context_crops:
+                    # 在真实 provider 调用前预扣预算
+                    self._vision_request_count += 1
+                    logger.info(
+                        "VLM context call %d/%d (%d valid crops, frame_ids=%s)",
+                        self._vision_request_count, budget,
+                        len(context_crops), valid_context_ids,
+                    )
+                    try:
+                        vlm_result = clf_vlm.classify_segment_frames(context_crops)
+                        vlm_count = vlm_result.get("mouse_count")
+                        vlm_colors = vlm_result.get("colors")
+                        vlm_conf = vlm_result.get("confidence", 0.0)
+                        vlm_method = vlm_result.get("method", "ear_tag_color_vlm")
+                        parse_status = vlm_result.get("parse_status", "ok")
+                        vlm_thermometer_present = vlm_result.get("thermometer_present", False)
+                        _vlm_context_raw_resp = vlm_result.get("raw_response")
+                        # A known first color is required; mouse two may explicitly be unknown.
+                        if (vlm_count in (1, 2) and isinstance(vlm_colors, list)
+                                and len(vlm_colors) == vlm_count and vlm_colors[0] != "unknown"
+                                and vlm_conf >= 0.3):
+                            # An injected pre-segment API is legacy: retain its historic
+                            # color-only fusion and local count. A provider's actual old
+                            # JSON has parse_status='legacy' and is still a valid count=1.
+                            vlm_context_count = None if parse_status == "legacy_provider" else vlm_count
+                            vlm_context_colors = vlm_colors
+                            vlm_context_color = vlm_colors[0]
+                            vlm_context_confidence = vlm_conf
+                            _vision_used_any = True
+                            logger.info("VLM count override: local=%s ai=%s confidence=%.3f thermometer=%s",
+                                        segment.get("estimated_mouse_count", 1), vlm_count, vlm_conf,
+                                        vlm_thermometer_present)
+                        else:
+                            logger.info("VLM context invalid/unknown/low confidence; falling back to CNN/HSV")
+                    except Exception as exc:
+                        logger.warning(
+                            "VLM context call FAILED: %s; budget consumed, falling back to CNN/HSV", exc
+                        )
+                        # Debug: 即使失败也尝试保存 crops
+                        self._save_vlm_context_debug(
+                            context_crops, valid_context_ids,
+                            clf_vlm._vision_provider, a_context, b_context, roi_core,
+                            error=str(exc),
+                        )
+                else:
+                    logger.info("VLM context: no valid crops (frames=%r); skipping vision", context_frame_ids)
+            else:
+                logger.debug("VLM context: vision provider not available")
+        # ---- 结束 VLM 上下文请求 ----
+
+        # A valid thermometer indication must not let the device-contaminated
+        # VLM count/colors override local evidence.  Keep `_vision_used_any` as
+        # the accepted-VLM marker needed for the safety result below.
+        if _vision_used_any and vlm_thermometer_present:
+            vlm_context_color = None
+            vlm_context_count = None
+            vlm_context_colors = None
 
         # ---- Three-round frame selection ----
         search_frames = []
@@ -249,6 +384,9 @@ class IdentityAssist:
 
         total_search = len(search_frames)
         logger.info(f"扫描帧数: {total_search} (R1密集+R2扩展+R3全段)")
+
+        # 跟踪是否 CNN 被使用（VLM 跟踪已在上方 VLM 上下文块处理）
+        _cnn_used_any = False
 
         for fi, frame_idx in enumerate(search_frames):
             cap.set(1, frame_idx)
@@ -309,7 +447,42 @@ class IdentityAssist:
                 if len(px) == 0:
                     continue
 
-                color, low_conf, best_ratio = self._classify_contour(px)
+                # ---- 提取 BGR patch 用于可选 CNN 推理 ----
+                # 取轮廓包围盒作为 patch（维持 2D 图像结构）
+                ys, xs = np.where(c_mask > 0)
+                patch_bgr = None
+                if len(ys) > 0:
+                    y1p, y2p = ys.min(), ys.max() + 1
+                    x1p, x2p = xs.min(), xs.max() + 1
+                    if y2p > y1p and x2p > x1p:
+                        patch_bgr = crop[y1p:y2p, x1p:x2p].copy()
+
+                # ---- 分类: CNN → HSV 规则回退 ----
+                # VLM 上下文已在 segment 级别处理，此处禁用 per-contour AI 视觉
+                clf = self._get_classifier()
+
+                # 永远禁用 per-contour 视觉调用（VLM 上下文已消耗段级预算）
+                allow_vision = False
+
+                # CNN/HSV 路径（allow_vision=False 确保不会触发网络调用）
+                if clf.is_available:
+                    resolved_color, resolved_method = clf.classify(
+                        patch_bgr, px, allow_vision=False
+                    )
+
+                    if resolved_method == "ear_tag_color_cnn":
+                        _cnn_used_any = True
+                        if resolved_color != "unknown":
+                            color = resolved_color
+                            low_conf = False
+                            best_ratio = 0.5
+                        else:
+                            color, low_conf, best_ratio = self._classify_contour(px)
+                    else:
+                        color, low_conf, best_ratio = self._classify_contour(px)
+                else:
+                    color, low_conf, best_ratio = self._classify_contour(px)
+
                 if color == "unknown":
                     continue
 
@@ -386,34 +559,93 @@ class IdentityAssist:
             logger.info(f"颜色 '{color}': hits={h['hit_count']} frames={len(h['frames'])} "
                         f"avg_area={np.mean(h['areas']):.1f} conf={h['confidence']:.2f}")
 
+        # ---- VLM 上下文结果融合 ----
+        # 仅当 context VLM 返回有效、置信度达阈值、非 unknown 颜色时才作为 VLM 成功结果。
+        # VLM 颜色直接 boost 到最高置信度，确保不会被 CNN/HSV 多色候选覆盖。
+        # 多鼠场景：VLM 颜色仅用于主要颜色决策，第二颜色仍由 CNN/HSV 提供。
+        if _vision_used_any and vlm_context_color:
+            if vlm_context_color not in color_hits:
+                # VLM 发现 CNN/HSV 未检测到的颜色 → 添加高置信度条目
+                color_hits[vlm_context_color] = {
+                    "hit_count": max(1, int(total_search * 0.3)),
+                    "frames": [],
+                    "confs": [],
+                    "areas": [],
+                    "confidence": 0.99,
+                }
+                logger.info(f"VLM fusion: added '{vlm_context_color}' (not found by CNN/HSV)")
+            else:
+                # VLM 颜色已被 CNN/HSV 检测到 → boost 其置信度
+                color_hits[vlm_context_color]["confidence"] = max(
+                    color_hits[vlm_context_color].get("confidence", 0), 0.99
+                )
+                logger.info(f"VLM fusion: boosted '{vlm_context_color}' confidence to 0.99")
+        elif _vision_used_any and not vlm_context_color and not vlm_thermometer_present:
+            # 预算已消耗但 VLM 未给出有效颜色（unknown/低置信度）→ VLM 标志复位
+            _vision_used_any = False
+            logger.info("VLM fusion: resetting VLM flag (no valid color from context)")
+
         # ---- Conflict resolution ----
         target_count = segment.get("estimated_mouse_count", 1)
         if target_count is None or target_count <= 0:
             target_count = 1
         target_count = min(target_count, 2)  # cap=2
 
-        colors = sorted(
+        ranked_colors = sorted(
             color_hits.keys(),
             key=lambda c: (
                 color_hits[c]["confidence"],          # primary: confidence
                 color_hits[c]["hit_count"],           # tiebreaker 1: 命中总数
-                len(set(color_hits[c]["frames"])),    # tiebreaker 2: 唯一帧数
+                len(set(color_hits[c]["frames"])),    # tiebreaker 2: unique frames
             ),
             reverse=True,
         )
+
+        # A successful context VLM answer is authoritative.  Do not encode this
+        # priority as a confidence boost: HSV/CNN may legitimately tie at 0.99
+        # and their secondary sort keys would then be able to displace the VLM.
+        if _vision_used_any and vlm_context_color:
+            ignored_rule_candidates = [
+                color for color in ranked_colors if color != vlm_context_color
+            ]
+            colors = [vlm_context_color] + ignored_rule_candidates
+            logger.info(
+                "VLM priority override: selected=%s, ignored_rule_candidates=%s",
+                vlm_context_color,
+                ignored_rule_candidates,
+            )
+        else:
+            colors = ranked_colors
         found_count = len(colors)
 
-        logger.info(f"冲突处理: target={target_count} found={found_count} colors={colors}")
+        # ---- 确定 identity_method 前缀 ----
+        if _vision_used_any:
+            method_prefix = "ear_tag_color_vlm"
+        elif _cnn_used_any:
+            method_prefix = "ear_tag_color_cnn"
+        else:
+            method_prefix = "ear_tag_color_rule"
+        logger.info(f"冲突处理: target={target_count} found={found_count} colors={colors} method={method_prefix}")
 
         auto_mouse_colors: list[str] = []
         auto_mouse_ids: list[str] = []
         identity_needs_review = False
         identity_conflict = False
         identity_confidence = 0.0
-        identity_method = "ear_tag_color"
+        identity_method = method_prefix
         note = ""
 
-        if found_count == 0:
+        if _vision_used_any and vlm_context_color and target_count == 1:
+            # A valid segment-level VLM result owns the single-mouse identity;
+            # retain HSV/CNN candidates only as diagnostic evidence.
+            auto_mouse_colors = [vlm_context_color]
+            auto_mouse_ids = [f"auto_{vlm_context_color}"]
+            identity_needs_review = False
+            identity_conflict = False
+            identity_confidence = vlm_context_confidence
+            identity_method += "|priority_override"
+
+        elif found_count == 0:
             auto_mouse_colors = ["unknown"] * target_count
             auto_mouse_ids = [""] * target_count
             identity_needs_review = True
@@ -466,8 +698,38 @@ class IdentityAssist:
                 f"显著丢弃={sig_dropped if sig_dropped else '无'}"
             )
 
+        # A valid segment VLM owns both count and ordered colors.  Do this after
+        # local aggregation so invalid AI outcomes retain the old local behavior.
+        if _vision_used_any and vlm_context_count and vlm_context_colors:
+            target_count = vlm_context_count
+            auto_mouse_colors = vlm_context_colors[:]
+            auto_mouse_ids = [f"auto_{c}" if c != "unknown" else "" for c in auto_mouse_colors]
+            identity_confidence = vlm_context_confidence
+            identity_method = "ear_tag_color_vlm|priority_override|count_override"
+            identity_conflict = False
+            identity_needs_review = False
+            notes = []
+            if "unknown" in auto_mouse_colors:
+                identity_needs_review = True
+                notes.append("VLM 第二只鼠耳标颜色未知")
+            if len(auto_mouse_colors) == 2 and auto_mouse_colors[0] == auto_mouse_colors[1]:
+                identity_needs_review = True
+                notes.append("VLM 两只鼠颜色重复，需人工复核")
+            if notes:
+                note = "; ".join(notes)
+
+        # A valid VLM result explicitly reporting a thermometer/probe is an
+        # interference signal, not a color/count answer.  Keep the local result
+        # intact but force manual review and zero identity confidence.
+        if _vision_used_any and vlm_thermometer_present:
+            identity_confidence = 0.0
+            identity_needs_review = True
+            identity_conflict = False
+            identity_method += "|thermometer_detected"
+            note = "检测到测温器/探头，颜色识别置信度已置零，请人工复核"
+
         # ---- Phase 8: A→B swap detection ----
-        if target_count == 1 and found_count >= 2:
+        if not (_vision_used_any and vlm_thermometer_present) and target_count == 1 and found_count >= 2:
             top2 = colors[:2]
             if self._temporal_separation(color_hits, top2, fps):
                 identity_conflict = True
@@ -476,6 +738,12 @@ class IdentityAssist:
                 identity_method += "|a_to_b"
 
         return {
+            "target_count": target_count,
+            "ai_mouse_count": vlm_context_count,
+            "ai_colors": vlm_context_colors,
+            "ai_confidence": vlm_context_confidence if _vision_used_any else 0.0,
+            "ai_parse_status": "ok" if _vision_used_any else "fallback",
+            "thermometer_present": bool(vlm_thermometer_present) if _vision_used_any else False,
             "auto_mouse_colors": auto_mouse_colors,
             "auto_mouse_ids": auto_mouse_ids,
             "identity_confidence": round(identity_confidence, 3),
@@ -484,6 +752,133 @@ class IdentityAssist:
             "identity_method": identity_method,
             "identity_note": note,
         }
+
+    def _save_vlm_context_debug(self, context_crops: list[np.ndarray],
+                                 frame_indices: list[int],
+                                 vision_provider, a_context: float, b_context: float,
+                                 roi_core: dict, response_json: dict | None = None,
+                                 error: str | None = None):
+        """MOUSE_COLOR_AI_SAVE_DEBUG=1 时，保存 VLM 上下文 debug 产物。
+
+        保存：
+          - 所有 context crops（文件名含排序和原视频 frame index）
+          - response JSON（成功或 API/解析失败）
+          - manifest JSON（provider/model 不含 key、帧索引、crop 算法/范围、结果/错误）
+
+        严格不保存 Authorization header/API key，不写入大型 base64 payload。
+        """
+        if os.environ.get("MOUSE_COLOR_AI_SAVE_DEBUG", "").strip() not in ("1", "true", "yes", "on"):
+            return
+        try:
+            out_dir = Path.cwd() / "debug_vision_output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+            # 保存 context crops
+            for i, (crop, fid) in enumerate(zip(context_crops, frame_indices)):
+                fname = f"context_{ts}_{i:02d}_frame_{fid:06d}.jpg"
+                cv2.imwrite(str(out_dir / fname), crop)
+
+            # 保存 response JSON
+            response_fname = None
+            if response_json is not None:
+                response_fname = f"response_{ts}.json"
+                with open(out_dir / response_fname, "w", encoding="utf-8") as f:
+                    json.dump(response_json, f, indent=2, ensure_ascii=False, default=str)
+
+            # 保存 manifest JSON
+            provider_name = getattr(vision_provider, '_method_name', 'unknown') if vision_provider else 'none'
+            model_name = getattr(vision_provider, '_model', 'unknown') if vision_provider else 'none'
+
+            manifest = {
+                "provider": provider_name,
+                "model": model_name,
+                "timestamp": datetime.now().isoformat(),
+                "frame_indices": frame_indices,
+                "num_context_crops": len(context_crops),
+                "crop_algorithm": "Search_ROI * 1.5 centered at ROI core (search_roi = core * SEARCH_SCALE)",
+                "crop_range": {
+                    "cx": roi_core["cx"],
+                    "cy": roi_core["cy"],
+                    "a_context": a_context,
+                    "b_context": b_context,
+                    "a_search": a_context / 1.5,
+                    "b_search": b_context / 1.5,
+                    "a_core": a_context / 1.5 / IdentityAssist.SEARCH_SCALE,
+                    "b_core": b_context / 1.5 / IdentityAssist.SEARCH_SCALE,
+                    "SEARCH_SCALE": IdentityAssist.SEARCH_SCALE,
+                },
+                "result": None,
+                "error": None,
+            }
+            # 记录 finish_reason 与 parse_status（不含 API key）
+            finish_reason = None
+            parse_status = "skipped"
+            if error:
+                manifest["error"] = {"type": type(error).__name__ if hasattr(type(error), '__name__') else "str",
+                                       "message": str(error)}
+                parse_status = "error"
+            elif response_json is not None:
+                # 提取 finish_reason
+                try:
+                    choices = response_json.get("choices", [])
+                    finish_reason = choices[0].get("finish_reason", "unknown") if choices else "unknown"
+                except Exception:
+                    finish_reason = "unknown"
+                # 解析响应中可能的结果
+                try:
+                    if choices:
+                        content = choices[0].get("message", {}).get("content", "")
+                        from .models.vision_provider import _parse_segment_json
+                        parsed = _parse_segment_json(content)
+                        if parsed:
+                            manifest["result"] = {"mouse_count": parsed["mouse_count"],
+                                                  "colors": parsed["colors"],
+                                                  "color": parsed["colors"][0],
+                                                  "confidence": parsed["confidence"],
+                                                  "thermometer_present": parsed["thermometer_present"]}
+                            parse_status = "ok" if parsed["parse_status"] == "legacy" else parsed["parse_status"]
+                        else:
+                            manifest["result"] = {"raw_content": content[:200]}
+                            parse_status = "no_json"
+                except Exception:
+                    parse_status = "parse_error"
+                if manifest["result"] is None:
+                    manifest["result"] = {"note": "response saved but parse failed"}
+                    parse_status = "parse_failed"
+            manifest["finish_reason"] = finish_reason
+            manifest["parse_status"] = parse_status
+            # Repeat parsed fields at stable top-level names for safe debug tooling.
+            parsed_result = manifest.get("result") or {}
+            manifest["ai_mouse_count"] = parsed_result.get("mouse_count")
+            manifest["ai_colors"] = parsed_result.get("colors")
+            manifest["confidence"] = parsed_result.get("confidence")
+            manifest["thermometer_present"] = parsed_result.get("thermometer_present")
+            # 记录 VLM max_tokens 上限用于截断诊断
+            try:
+                if vision_provider and hasattr(vision_provider, '_max_tokens'):
+                    mt = vision_provider._max_tokens
+                    if isinstance(mt, int):
+                        manifest["max_tokens"] = mt
+                    else:
+                        manifest["max_tokens"] = None
+                else:
+                    manifest["max_tokens"] = None
+            except Exception:
+                manifest["max_tokens"] = None
+
+            manifest_fname = f"manifest_{ts}.json"
+            with open(out_dir / manifest_fname, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+            logger.info(
+                "VLM context debug saved: %d crops + %s + %s",
+                len(context_crops),
+                response_fname or "no_response",
+                manifest_fname,
+            )
+        except Exception as exc:
+            logger.debug("VLM context debug save failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -605,6 +1000,12 @@ def apply_identity_to_segment(segment: dict, id_result: dict) -> dict:
     """
     if segment.get("count_status") == "confirmed":
         return segment
+
+    # Keep canonical automatic count in sync before GUI/CSV consumers inspect it.
+    target_count = id_result.get("target_count")
+    if target_count in (1, 2):
+        segment["estimated_mouse_count"] = target_count
+        segment["mouse_count"] = target_count
 
     segment["auto_mouse_colors"] = id_result["auto_mouse_colors"]
     segment["auto_mouse_ids"] = id_result["auto_mouse_ids"]
