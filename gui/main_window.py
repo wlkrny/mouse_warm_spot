@@ -31,7 +31,8 @@ from detection.engine import DetectionEngine
 from detection.counter import MouseCounter
 from detection.identity_assist import IdentityAssist, apply_identity_to_segment
 from detection.color_mouse_mapping import ColorMouseMappingStore
-from detection.batch_color import batch_color_concurrency, batch_items, batch_summary
+from detection.batch_color import (batch_color_concurrency, batch_items, batch_summary,
+                                   is_single_mouse_segment)
 from export.csv_exporter import CsvExporter
 
 
@@ -1708,6 +1709,14 @@ class MainWindow(QMainWindow):
         seg = self._event_list.get_segment(seg_idx)
         if not seg:
             return
+        if not is_single_mouse_segment(seg):
+            QMessageBox.information(
+                self,
+                "颜色识别",
+                "颜色识别仅适用于数量为 1 的片段。\n"
+                "请先使用 Shift+1 确认当前片段只有 1 只小鼠。",
+            )
+            return
         progress = QProgressDialog(f"颜色识别: 正在分析片段 #{seg.get('segment_id', '?')}...", "取消", 0, 100, self)
         progress.setWindowTitle("颜色识别")
         progress.setWindowModality(Qt.WindowModal)
@@ -1754,7 +1763,10 @@ class MainWindow(QMainWindow):
     def _start_batch_color_identify(self, roi_data):
         items = batch_items(self._event_list.get_segments())
         if not items:
-            QMessageBox.information(self, "颜色识别", "没有可处理的非空事件。")
+            QMessageBox.information(
+                self, "颜色识别",
+                "没有可处理的数量为 1 的片段。请先用 Shift+1 确认片段数量。"
+            )
             return
         progress = QProgressDialog("颜色识别: 准备中...", "取消", 0, 100, self)
         progress.setWindowTitle("全部事件颜色识别")

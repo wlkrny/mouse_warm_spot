@@ -5,8 +5,8 @@ from __future__ import annotations
 import math
 import os
 
-DEFAULT_BATCH_CONCURRENCY = 2
-MAX_BATCH_CONCURRENCY = 4
+DEFAULT_BATCH_CONCURRENCY = 6
+MAX_BATCH_CONCURRENCY = 6
 
 
 def batch_color_concurrency(value: str | None = None) -> int:
@@ -19,10 +19,22 @@ def batch_color_concurrency(value: str | None = None) -> int:
     return parsed if 1 <= parsed <= MAX_BATCH_CONCURRENCY else DEFAULT_BATCH_CONCURRENCY
 
 
+def is_single_mouse_segment(segment: dict) -> bool:
+    """Return whether a segment is eligible for one-mouse color recognition.
+
+    A manual confirmed count is more trustworthy than the automatic estimate.
+    When no valid confirmation exists, fall back to ``estimated_mouse_count``.
+    """
+    confirmed = segment.get("confirmed_mouse_count")
+    count = confirmed if isinstance(confirmed, int) and not isinstance(confirmed, bool) else \
+        segment.get("estimated_mouse_count")
+    return count == 1
+
+
 def batch_items(segments: list[dict]) -> list[tuple[int, dict]]:
-    """Return eligible non-zero timeline segments without mutating them."""
+    """Return valid one-mouse timeline segments without mutating them."""
     return [(index, segment) for index, segment in enumerate(segments)
-            if segment.get("estimated_mouse_count") != 0
+            if is_single_mouse_segment(segment)
             and segment.get("start_frame") is not None
             and segment.get("end_frame") is not None
             and segment["end_frame"] >= segment["start_frame"]]

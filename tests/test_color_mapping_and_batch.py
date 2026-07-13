@@ -5,7 +5,7 @@ import json
 import pytest
 
 from detection.batch_color import (DEFAULT_BATCH_CONCURRENCY, batch_color_concurrency,
-                                   batch_items, batch_summary)
+                                   batch_items, batch_summary, is_single_mouse_segment)
 from detection.color_mouse_mapping import ColorMouseMappingStore
 from detection.identity_assist import IdentityAssist, apply_identity_to_segment
 
@@ -58,13 +58,22 @@ def test_apply_mapping_protects_confirmed_zero_and_ambiguous(tmp_path):
 def test_batch_config_scope_and_summary(monkeypatch):
     assert batch_color_concurrency("1") == 1
     assert batch_color_concurrency("4") == 4
+    assert batch_color_concurrency("6") == 6
     assert batch_color_concurrency("0") == DEFAULT_BATCH_CONCURRENCY
-    assert batch_color_concurrency("5") == DEFAULT_BATCH_CONCURRENCY
+    assert batch_color_concurrency("7") == DEFAULT_BATCH_CONCURRENCY
     assert batch_color_concurrency("invalid") == DEFAULT_BATCH_CONCURRENCY
-    segments = [{"start_frame": 0, "end_frame": 1, "estimated_mouse_count": 1},
-                {"start_frame": 2, "end_frame": 3, "estimated_mouse_count": 0},
-                {"start_frame": 4, "end_frame": 3, "estimated_mouse_count": 1}]
-    assert [index for index, _ in batch_items(segments)] == [0]
+    segments = [
+        {"start_frame": 0, "end_frame": 1, "estimated_mouse_count": 1},
+        {"start_frame": 2, "end_frame": 3, "estimated_mouse_count": 0},
+        {"start_frame": 4, "end_frame": 5, "estimated_mouse_count": 2},
+        {"start_frame": 6, "end_frame": 7, "estimated_mouse_count": 2,
+         "confirmed_mouse_count": 1},
+        {"start_frame": 8, "end_frame": 7, "estimated_mouse_count": 1},
+    ]
+    assert [index for index, _ in batch_items(segments)] == [0, 3]
+    assert is_single_mouse_segment(segments[0])
+    assert not is_single_mouse_segment(segments[2])
+    assert is_single_mouse_segment(segments[3])
     summary = batch_summary([
         _result(["green"], ai_api_cost_usd=.0012),
         _result(["red"], thermometer_present=True, identity_needs_review=True,
