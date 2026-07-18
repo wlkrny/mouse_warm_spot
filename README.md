@@ -1,151 +1,152 @@
-# 小鼠暖点占据半自动标注系统
+> 📖 English | [中文](README_CN.md)
 
-桌面 GUI 程序，用于分析小鼠暖点实验视频。系统自动检测暖点被遮挡的时间段，并估计小鼠数量；人工通过快捷键快速审核并标注小鼠身份，最后导出统计表。
+# Mouse Warm Spot Semi-Automatic Annotation System
 
-## 安装与运行
+A desktop GUI application for analyzing mouse warm-spot experiment videos. The system automatically detects periods when the warm spot is occluded, estimates the number of mice, and allows manual review with keyboard shortcuts for identity annotation before exporting statistical tables.
+
+## Installation & Running
 
 ```bash
-# 1. 进入项目目录
+# 1. Enter the project directory
 cd mouse_warm_spot
 
-# 2. 安装依赖
+# 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. (可选) 安装 AI 推理依赖（ONNX CNN + AI 视觉模型 HTTP 客户端）
+# 3. (Optional) Install AI inference dependencies (ONNX CNN + AI vision model HTTP client)
 pip install -r requirements-ai.txt
 
-# 4. (可选) 配置 AI 视觉识别（Kimi / MiniMax / OpenRouter）
-# 将以下环境变量导出到进程环境中，或创建 .env 文件后 source：
+# 4. (Optional) Configure AI vision recognition (Kimi / MiniMax / OpenRouter)
+# Export the following environment variables into the process environment, or create a .env file and source it:
 #   MOUSE_COLOR_AI_PROVIDER=openrouter
 #   OPENROUTER_API_KEY=<your-key>
 #   OPENROUTER_API_BASE=https://openrouter.ai/api/v1
 #   OPENROUTER_VISION_MODEL=minimax/minimax-m3
-# 详见下方「可选 AI 视觉识别」章节
+# See the "Optional AI Vision Recognition" section below for details
 
-# 5. 启动（若使用 .env，需 source 后再启动）
+# 5. Launch (if using .env, source it before launching)
 set -a && source .env && set +a && python main.py
-
-### 可选 AI 推理（耳标颜色 CNN 分类器）
-
-系统默认使用 HSV 规则对耳标颜色进行分类，无需任何额外依赖。如需更准确的颜色识别，可启用基于 ONNX 的轻量 CNN 分类器：
-
-```bash
-# 安装可选 AI 推理依赖
-pip install -r requirements-ai.txt
-
-# 将训练好的 ONNX 模型放入 detection/models/ 目录
-# 期望文件名: ear_tag_classifier.onnx
-# 程序会自动发现该文件并启用 CNN 推理
 ```
 
-**环境变量控制**（无需修改代码）：
+### Optional AI Inference (Ear Tag Color CNN Classifier)
 
-| 环境变量 | 说明 | 默认值 |
-|---|---|---|
-| `MOUSE_COLOR_MODEL_PATH` | 自定义 ONNX 模型文件路径 | 自动发现 `detection/models/ear_tag_classifier.onnx` |
-| `MOUSE_COLOR_USE_CNN` | 是否启用 CNN（`0`=禁用，`1`=启用） | 自动检测（依赖 + 文件均可用时启用） |
-
-回退机制：
-
-| 场景 | 行为 |
-|---|---|
-| `onnxruntime` 未安装 | 静默降级为 HSV 规则，不影响程序功能 |
-| 模型文件不存在 | 静默降级为 HSV 规则 |
-| CNN 推理失败（任何异常） | 该轮廓自动回退到 HSV 规则；其余轮廓正常处理 |
-| `MOUSE_COLOR_USE_CNN=0` | 强制使用 HSV 规则，不尝试加载模型 |
-
-识别结果中 `identity_method` 字段会标明实际使用的分类方式：
-- `ear_tag_color_vlm|exact_match` — AI 视觉模型推理成功 (Kimi / Minimax / OpenRouter)
-- `ear_tag_color_cnn|exact_match` — ONNX CNN 推理成功
-- `ear_tag_color_rule|exact_match` — 使用 HSV 规则
-
-### 可选 AI 视觉识别（GPT）
-
-系统支持将 segment 的大范围上下文图像（多帧）发送到 AI 视觉大模型进行颜色识别，
-每个 segment 仅调用一次，优先级高于 CNN 和 HSV 规则。
-
-**工作原理**：
-- 每个 CountSegment 选择最多 9 帧上下文图像：头三帧 (start, start+5, start+10)、中间三帧 (mid-5, mid, mid+5)、尾三帧 (end-10, end-5, end)，帧间隔为 5
-- 每帧裁剪外圈大范围图像：以 ROI 核心中心为中心，搜索 ROI（Core × 2.8）× 1.5 的矩形区域；实际发送图像以细青色椭圆标出 ROI Core，不遮挡耳标
-- 9 帧在一个请求中按时间顺序发送给 VLM，附带前/中/后上下文提示词；模型只按实际接触/进入 Core 的暖点占领鼠判断数量和耳标，外圈/角落游离鼠必须忽略
-- 短 segment 帧数不足时会去重并安全夹取到 [start, end]
-
-**成本控制**：
-- 每个 segment 仅消耗 1 次 `MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT` 预算
-- 预算在真实 API 调用前预扣，网络/API/解析失败仍消耗该次额度
-- 预算为 0 时完全禁用 AI 视觉（不产生网络调用）
-
-**结果融合**：
-- VLM 返回合法 `mouse_count`（仅 1/2）、首个已知颜色且置信度 ≥ 0.3 时，优先重确认 segment 计数，并同步 `estimated_mouse_count`、`mouse_count` 与返回的 `target_count`
-- VLM 的有序颜色直接作为结果；单鼠不会被规则候选覆盖。双鼠第二色为 `unknown` 或两色重复时保守标记复核，绝不凭规则臆造颜色
-- VLM 失败、unknown、低置信度、无效 JSON 或无有效 crop 时完整回退到原 CNN/HSV 和本地计数
-- 已人工 confirmed 的 segment 不会被自动写回覆盖
-
-**环境变量配置**（全部必填，无默认值；请从供应商文档获取当前正确的端点与模型名）：
-
-| 环境变量 | 说明 | 默认值 |
-|---|---|---|
-| `MOUSE_COLOR_AI_PROVIDER` | 本功能使用的视觉识别 provider：`kimi` / `minimax` / `openrouter` / `gpt`（或 `hsv` 禁用） | `hsv`（仅使用 HSV 规则） |
-| `MOUSE_COLOR_AI_TIMEOUT` | API 请求超时秒数 | `30` |
-| `MOUSE_COLOR_AI_MAX_TOKENS` | AI 视觉输出 token 上限（必须为正整数；对带 reasoning 的模型建议 ≥512） | `512` |
-| `MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT` | 每个 segment 最多云视觉请求数（`0`=禁用云视觉） | `3` |
-| `MOUSE_COLOR_BATCH_CONCURRENCY` | 批量颜色识别并发数上限（1=串行, 2=默认, 最大4；非法值自动回退2） | `2` |
-| `MOUSE_COLOR_AI_SAVE_DEBUG` | `1`=保存每次 VLM 请求的 context crop / response / manifest 到 `debug_vision_output/<clip_id>/` | 不保存 |
-
-### Kimi (Moonshot) 所需环境变量：
-
-| 环境变量 | 说明 |
-|---|---|
-| `KIMI_API_KEY` | API 密钥 |
-| `KIMI_API_BASE` | API 端点 URL |
-| `KIMI_VISION_MODEL` | 视觉模型名 |
-
-**MiniMax** 所需环境变量：
-
-| 环境变量 | 说明 |
-|---|---|
-| `MINIMAX_API_KEY` | API 密钥 |
-| `MINIMAX_API_BASE` | API 端点 URL |
-| `MINIMAX_VISION_MODEL` | 视觉模型名 |
-
-**OpenRouter** 所需环境变量：
-
-| 环境变量 | 说明 |
-|---|---|
-| `OPENROUTER_API_KEY` | API 密钥 |
-| `OPENROUTER_API_BASE` | API 端点 URL |
-| `OPENROUTER_VISION_MODEL` | 视觉模型名 |
-
-**配置方式**：
-
-这些环境变量需要导出到进程环境，或由用户现有启动器注入。项目**不会**自动加载 `.env` 文件。
-
-如果用户的启动器支持 `.env`（如 `python-dotenv`、shell 脚本 `source .env`、IDE 运行配置等），
-则将以下变量写入 `.env` 作为参考方案：
+The system uses HSV rules for ear tag color classification by default, requiring no extra dependencies. For more accurate color recognition, you can enable the lightweight ONNX-based CNN classifier:
 
 ```bash
-# 使用 Kimi 视觉模型（示例，请替换为实际值）
+# Install optional AI inference dependencies
+pip install -r requirements-ai.txt
+
+# Place the trained ONNX model in the detection/models/ directory
+# Expected filename: ear_tag_classifier.onnx
+# The program auto-discovers this file and enables CNN inference
+```
+
+**Environment Variable Controls** (no code changes needed):
+
+| Environment Variable | Description | Default |
+|---|---|---|
+| `MOUSE_COLOR_MODEL_PATH` | Custom ONNX model file path | Auto-discover `detection/models/ear_tag_classifier.onnx` |
+| `MOUSE_COLOR_USE_CNN` | Enable CNN (`0`=disable, `1`=enable) | Auto-detect (enabled when dependency + file are both available) |
+
+Fallback Behavior:
+
+| Scenario | Behavior |
+|---|---|
+| `onnxruntime` not installed | Silent fallback to HSV rules; no impact on program function |
+| Model file not found | Silent fallback to HSV rules |
+| CNN inference failure (any exception) | That contour falls back to HSV; remaining contours processed normally |
+| `MOUSE_COLOR_USE_CNN=0` | Forces HSV rules; no model loading attempted |
+
+The `identity_method` field in recognition results indicates the actual classification method used:
+- `ear_tag_color_vlm|exact_match` — AI vision model successful (Kimi / MiniMax / OpenRouter)
+- `ear_tag_color_cnn|exact_match` — ONNX CNN successful
+- `ear_tag_color_rule|exact_match` — HSV rules used
+
+### Optional AI Vision Recognition (GPT)
+
+The system can send large-context images (multi-frame) of a segment to a vision-language model for color recognition. Only one call is made per segment, with priority over CNN and HSV.
+
+**How It Works**:
+- Up to 9 context frames are selected per CountSegment: first three (start, start+5, start+10), middle three (mid-5, mid, mid+5), and last three (end-10, end-5, end), with a frame interval of 5
+- Each frame is cropped to a large outer region: centered on the ROI core center, the search area is (Core × 2.8) × 1.5 rectangle; the sent image marks the ROI Core with a thin cyan ellipse without occluding ear tags
+- All 9 frames are sent in a single request in chronological order, with front/middle/end context prompts; the model judges mouse count and ear tag colors based only on mice actually occupying or entering the Core; outer/corner wandering mice must be ignored
+- Short segments with fewer frames are deduplicated and safely clamped to [start, end]
+
+**Cost Control**:
+- Each segment consumes only 1 `MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT` budget
+- Budget is deducted before the real API call; network/API/parse failures still consume the quota
+- When budget is 0, AI vision is fully disabled (no network calls)
+
+**Result Fusion**:
+- When VLM returns legal `mouse_count` (1/2 only), a first known color, and confidence ≥ 0.3, it re-confirms the segment count and syncs `estimated_mouse_count`, `mouse_count` with the returned `target_count`
+- VLM's ordered colors are used directly; a single mouse is not overwritten by rule-based candidates. For two mice, if the second color is `unknown` or duplicate, it is conservatively flagged for review — colors are never fabricated by rules
+- VLM failure, unknown, low confidence, invalid JSON, or no valid crops → complete fallback to original CNN/HSV and local counting
+- Segments already manually confirmed are never overwritten
+
+**Environment Variable Configuration** (all required, no defaults; obtain correct endpoints and model names from provider documentation):
+
+| Environment Variable | Description | Default |
+|---|---|---|
+| `MOUSE_COLOR_AI_PROVIDER` | Vision recognition provider: `kimi` / `minimax` / `openrouter` / `gpt` (or `hsv` to disable) | `hsv` (HSV rules only) |
+| `MOUSE_COLOR_AI_TIMEOUT` | API request timeout in seconds | `30` |
+| `MOUSE_COLOR_AI_MAX_TOKENS` | AI vision output token limit (must be positive integer; recommended ≥512 for reasoning models) | `512` |
+| `MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT` | Max cloud vision requests per segment (`0`=disable cloud vision) | `3` |
+| `MOUSE_COLOR_BATCH_CONCURRENCY` | Max concurrent batch color recognition tasks (1=serial, 2=default, max 4; invalid values fall back to 2) | `2` |
+| `MOUSE_COLOR_AI_SAVE_DEBUG` | `1`=save each VLM request's context crop / response / manifest to `debug_vision_output/<clip_id>/` | Off |
+
+### Kimi (Moonshot) Required Environment Variables:
+
+| Environment Variable | Description |
+|---|---|
+| `KIMI_API_KEY` | API key |
+| `KIMI_API_BASE` | API endpoint URL |
+| `KIMI_VISION_MODEL` | Vision model name |
+
+### MiniMax Required Environment Variables:
+
+| Environment Variable | Description |
+|---|---|
+| `MINIMAX_API_KEY` | API key |
+| `MINIMAX_API_BASE` | API endpoint URL |
+| `MINIMAX_VISION_MODEL` | Vision model name |
+
+### OpenRouter Required Environment Variables:
+
+| Environment Variable | Description |
+|---|---|
+| `OPENROUTER_API_KEY` | API key |
+| `OPENROUTER_API_BASE` | API endpoint URL |
+| `OPENROUTER_VISION_MODEL` | Vision model name |
+
+**Configuration Method**:
+
+These environment variables must be exported to the process environment or injected by the user's existing launcher. The project does **not** auto-load `.env` files.
+
+If the user's launcher supports `.env` (e.g., `python-dotenv`, shell script `source .env`, IDE run configs, etc.), write the following variables into `.env` as a reference:
+
+```bash
+# Using Kimi vision model (example; replace with actual values)
 MOUSE_COLOR_AI_PROVIDER=kimi
 KIMI_API_KEY=<your-api-key>
 KIMI_API_BASE=<provider-base-url>
 KIMI_VISION_MODEL=<vision-capable-model-id>
 
-# 或使用 MiniMax 视觉模型
+# Or using MiniMax vision model
 # MOUSE_COLOR_AI_PROVIDER=minimax
 # MINIMAX_API_KEY=<your-api-key>
 # MINIMAX_API_BASE=<provider-base-url>
 # MINIMAX_VISION_MODEL=<vision-capable-model-id>
 
-# 每 segment 最多 3 次云请求（超出后仅 CNN/HSV）
+# Max 3 cloud requests per segment (beyond that, CNN/HSV only)
 MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT=3
 ```
 
-直接启动时，请用环境变量方式：
+For direct launch, use environment variable injection:
 ```bash
 KIMI_API_KEY=<your-api-key> KIMI_API_BASE=<provider-base-url> KIMI_VISION_MODEL=<vision-capable-model-id> python main.py
 ```
 
-**响应 JSON 契约**（模型需返回以下结构）：
+**Response JSON Contract** (model must return the following structure):
 
 ```json
 {
@@ -156,255 +157,257 @@ KIMI_API_KEY=<your-api-key> KIMI_API_BASE=<provider-base-url> KIMI_VISION_MODEL=
 }
 ```
 
-- `mouse_count` 只能为整数 `1` 或 `2`；`colors` 长度必须与其一致，且每项只能为 `red/yellow/blue/green/white/unknown`
-- `confidence` 必须为 0.0~1.0，低于 0.3 自动回退。仅解析最终 `content` 中的完整 JSON，绝不从 reasoning 推断
-- `thermometer_present` 必须为 JSON boolean；缺失时为兼容旧响应按 `false` 处理，存在但不是 boolean 时整条 VLM 结果无效并回退
-- VLM 已接受且 `thermometer_present=true` 时，不采用其 count/colors 覆盖本地结果，并将 `identity_confidence=0.0`、`identity_needs_review=true`、`identity_conflict=false`，`identity_method` 加 `thermometer_detected`；提示人工复核。已 confirmed 事件仍不被写回覆盖
-- 兼容旧最终 JSON `{ "color": "red", "confidence": 0.85 }`，按单鼠处理；新请求始终要求新契约
+- `mouse_count` must be integer `1` or `2`; `colors` length must match, each item must be one of `red/yellow/blue/green/white/unknown`
+- `confidence` must be 0.0–1.0; below 0.3 triggers automatic fallback. Only the final `content` JSON is parsed — reasoning text is never inferred from
+- `thermometer_present` must be a JSON boolean; missing it is treated as `false` for compatibility; if present but not boolean, the entire VLM result is invalid and falls back
+- When VLM is accepted and `thermometer_present=true`, the model's count/colors are not used to overwrite local results; `identity_confidence=0.0`, `identity_needs_review=true`, `identity_conflict=false`, and `identity_method` includes `thermometer_detected`; prompts manual review. Already confirmed events are still not overwritten
+- Legacy final JSON `{ "color": "red", "confidence": 0.85 }` is compatible and treated as single mouse; new requests always use the new contract
 
-**回退行为**：
+**Fallback Behavior**:
 
-| 场景 | 行为 |
+| Scenario | Behavior |
 |---|---|
-| `MOUSE_COLOR_AI_PROVIDER=hsv` 或未设置 | 不启用 AI 视觉，走 CNN/HSV |
-| `MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT=0` | 禁用云视觉，仅 CNN/HSV |
-| API 密钥缺失 | 启动时记录警告，回退到 CNN/HSV |
-| API Base URL 或模型名缺失 | 启动时报告具体缺失变量（可诊断错误） |
-| VLM 上下文请求失败（网络/API/解析） | 消耗该次预算，回退到 CNN/HSV，不标 VLM |
-| 模型返回无效 JSON | 解析失败，回退到 CNN/HSV |
-| 模型输出被截断 (finish_reason=length, 无可解析 JSON) | 回退到 CNN/HSV，日志建议提高 `MOUSE_COLOR_AI_MAX_TOKENS`。注意：reasoning 中的自然语言文本不会被当作分类结果 |
-| VLM 返回 unknown 或置信度 < 0.3 | 视为失败，消耗预算，回退到 CNN/HSV |
-| Segment 无有效 context crop | 不消耗预算，直接走 CNN/HSV |
+| `MOUSE_COLOR_AI_PROVIDER=hsv` or unset | AI vision disabled; use CNN/HSV |
+| `MOUSE_COLOR_AI_MAX_REQUESTS_PER_SEGMENT=0` | Cloud vision disabled; CNN/HSV only |
+| API key missing | Warning at startup; fallback to CNN/HSV |
+| API Base URL or model name missing | Report specific missing variables at startup (diagnosable error) |
+| VLM context request failure (network/API/parse) | Consumes budget; fallback to CNN/HSV; not marked as VLM |
+| Model returns invalid JSON | Parse failure; fallback to CNN/HSV |
+| Output truncated (finish_reason=length, no parseable JSON) | Fallback to CNN/HSV; log suggests increasing `MOUSE_COLOR_AI_MAX_TOKENS`. Note: natural language in reasoning is not used as classification results |
+| VLM returns unknown or confidence < 0.3 | Treated as failure; budget consumed; fallback to CNN/HSV |
+| Segment has no valid context crop | Budget not consumed; directly use CNN/HSV |
 
-**GUI 范围选择与并发**：点击“颜色识别”后选择“当前事件”“全部事件”或“取消”。未选事件时“当前事件”不可用。全部事件跳过 0 鼠片段，默认以 **2** 个独立任务受限并发运行（`MOUSE_COLOR_BATCH_CONCURRENCY=1` 为串行，最大 **4**；非法值回退 2），每任务拥有独立 VideoCapture/IdentityAssist，仍不增加每 segment 的 VLM 请求预算。进度显示真实完成数/总数和当前事件 ID；取消不再提交未启动任务，运行任务安全完成且其结果保留。并发会增加 provider 同时请求和成本峰值，请保持保守默认值。
+**GUI Scope Selection & Concurrency**: After clicking "Color Recognition", choose "Current Event", "All Events", or "Cancel". When no event is selected, "Current Event" is unavailable. "All Events" skips zero-mouse segments and runs at **2** concurrent tasks by default (`MOUSE_COLOR_BATCH_CONCURRENCY=1` for serial; max **4**; invalid values fall back to 2). Each task has an independent VideoCapture/IdentityAssist and does not increase the per-segment VLM request budget. Progress shows real completed/total counts and current event ID; cancel stops unstarted tasks while running tasks complete safely and their results are preserved. Concurrency increases simultaneous provider load and cost peaks — keep the conservative default.
 
-**Debug 排错**：
+**Debug & Troubleshooting**:
 
-设置 `MOUSE_COLOR_AI_SAVE_DEBUG=1` 后，每次 segment 的 VLM 上下文请求保存到 `debug_vision_output/<clip_id>/` 子目录：
-- 所有 context crops（文件名含排序编号和原视频帧索引）
-- API 响应 JSON（成功或失败均保存）
-- Manifest JSON（provider/model 不含 API key、clip_id、选中帧索引、crop 算法/范围、解析结果或错误信息）
+Set `MOUSE_COLOR_AI_SAVE_DEBUG=1` to save each segment's VLM context request to `debug_vision_output/<clip_id>/` subdirectories:
+- All context crops (filenames include ordering index and original video frame index)
+- API response JSON (saved on both success and failure)
+- Manifest JSON (provider/model without API key, clip_id, selected frame indices, crop algorithm/range, parse result or error info)
 
-每个 clip 独立子目录，便于按 segment 排查问题。
+Each clip has its own subdirectory for per-segment troubleshooting.
 
-**provider 架构**：
-- `VisionProvider` (ABC): 抽象接口 `classify(patch_bgr) → (color, confidence, method)` + `classify_frames(frames) → (color, confidence, method, raw_json)`
-- `KimiVisionProvider` / `MinimaxVisionProvider` / `OpenRouterVisionProvider`: OpenAI-compatible 实现
-- `VisionProviderFactory`: 工厂创建，支持通过 `register()` 扩展新 provider
-- 位于 `detection/models/vision_provider.py`
+**Provider Architecture**:
+- `VisionProvider` (ABC): Abstract interface `classify(patch_bgr) → (color, confidence, method)` + `classify_frames(frames) → (color, confidence, method, raw_json)`
+- `KimiVisionProvider` / `MinimaxVisionProvider` / `OpenRouterVisionProvider`: OpenAI-compatible implementations
+- `VisionProviderFactory`: Factory creation, supports extending new providers via `register()`
+- Located in `detection/models/vision_provider.py`
 
-## 技术栈
+## Tech Stack
 
-| 模块 | 技术 |
+| Module | Technology |
 |---|---|
-| 语言 | Python 3.9+ |
+| Language | Python 3.9+ |
 | GUI | PySide6 |
-| 视频/图像 | OpenCV + NumPy |
-| AI 推理（可选） | ONNX Runtime (onnxruntime) / AI 视觉模型 (Kimi/Minimax) |
+| Video/Image | OpenCV + NumPy |
+| AI Inference (optional) | ONNX Runtime (onnxruntime) / AI Vision Models (Kimi/Minimax/OpenRouter) |
 
-## 核心设计
+## Core Design
 
 ```
-不自动识别小鼠身份。
-不逐帧全视频高精度检测。
+No automatic mouse identity recognition.
+No frame-by-frame full-video high-precision detection.
 
-隔帧粗筛 → 触发回溯 → 局部逐帧精查 → 人工标注鼠标号
+Sparse frame coarse screening → trigger backtracking → local frame-by-frame fine inspection → manual mouse annotation
 ```
 
-检测逻辑围绕 **暖点核心 ROI 是否被深色小鼠身体遮挡**，不做全画面运动检测。
+Detection logic focuses on **whether the warm-spot core ROI is occluded by a dark mouse body**; no full-frame motion detection is performed.
 
 ---
 
-## 项目结构
+## Project Structure
 
 ```
 mouse_warm_spot/
-├── main.py                      # 入口 + 暗色主题
+├── main.py                      # Entry point + dark theme
 ├── requirements.txt             # PySide6 + OpenCV + NumPy
-├── requirements-ai.txt          # 可选 AI 推理依赖 (onnxruntime + requests)
+├── requirements-ai.txt          # Optional AI inference deps (onnxruntime + requests)
 ├── README.md
+├── README_CN.md                 # Chinese README
+├── 操作文档.md                   # Chinese operational guide
 ├── gui/
-│   ├── main_window.py           # 主窗口：工具栏、菜单、信号连接、检测控制
-│   ├── video_widget.py          # 视频显示 + ROI A/B/C 叠加 + 循环播放
-│   ├── zoom_widget.py           # 暖点 ROI 放大窗口 (2x)
-│   ├── metrics_panel.py         # 遮挡指标 + 小鼠计数 + 调试信息
-│   ├── event_list_widget.py     # 事件列表 (CountSegment) + 颜色状态 + 右键菜单
-│   ├── annotation_panel.py      # 标注面板：小鼠选择 + 数量确认
-│   └── calibration_store.py     # 校准样本多帧管理器
+│   ├── main_window.py           # Main window: toolbar, menus, signal wiring, detection control
+│   ├── video_widget.py          # Video display + ROI A/B/C overlay + loop playback
+│   ├── zoom_widget.py           # Warm-spot ROI zoom window (2x)
+│   ├── metrics_panel.py         # Occlusion metrics + mouse count + debug info
+│   ├── event_list_widget.py     # Event list (CountSegment) + color status + context menu
+│   ├── annotation_panel.py      # Annotation panel: mouse selection + count confirmation
+│   └── calibration_store.py     # Calibration sample multi-frame manager
 ├── detection/
-│   ├── metrics.py               # 单帧遮挡检测指标 (occupancy)
-│   ├── engine.py                # 全视频两层检测引擎 (OccupancyEpisode + CountSegment)
-│   ├── counter.py               # 小鼠数量估计引擎 (MouseCounter)
-│   ├── identity_assist.py       # 耳标颜色辅助检测（HSV 规则 + 可选 ONNX CNN）
-│   ├── color_mouse_mapping.py   # 颜色到鼠号的持久一对一映射
-│   ├── batch_color.py           # 批量颜色识别并发工具
-│   └── models/                  # AI 推理模型
+│   ├── metrics.py               # Single-frame occlusion detection metrics (occupancy)
+│   ├── engine.py                # Full-video two-layer detection engine (OccupancyEpisode + CountSegment)
+│   ├── counter.py               # Mouse count estimation engine (MouseCounter)
+│   ├── identity_assist.py       # Ear tag color assist (HSV rules + optional ONNX CNN)
+│   ├── color_mouse_mapping.py   # Persistent one-to-one color-to-mouse-id mapping
+│   ├── batch_color.py           # Batch color recognition concurrency tool
+│   └── models/                  # AI inference models
 │       ├── __init__.py
-│       ├── classifier.py        # EarTagClassifier: ONNX 包装器 + HSV 回退
-│       └── vision_provider.py   # AI 视觉 provider (Kimi/MiniMax/OpenRouter)
+│       ├── classifier.py        # EarTagClassifier: ONNX wrapper + HSV fallback
+│       └── vision_provider.py   # AI vision provider (Kimi/MiniMax/OpenRouter)
 ├── export/
 │   ├── __init__.py
-│   └── csv_exporter.py          # CSV/Markdown 导出
+│   └── csv_exporter.py          # CSV/Markdown export
 └── tests/
     ├── __init__.py
-    ├── test_color_classifier.py         # 颜色分类器单元测试
-    ├── test_vision_provider.py          # AI 视觉 provider 单元测试
-    ├── test_thermometer.py              # 温度计检测单元测试
-    ├── test_core_clip_splitting.py      # Core 分割边界回归测试
-    └── test_core_connected_counting.py  # Core 接触计数回归测试
+    ├── test_color_classifier.py         # Color classifier unit tests
+    ├── test_vision_provider.py          # AI vision provider unit tests
+    ├── test_thermometer.py              # Thermometer detection unit tests
+    ├── test_core_clip_splitting.py      # Core clip splitting regression tests
+    └── test_core_connected_counting.py  # Core connected counting regression tests
 ```
 
 ---
 
-## 使用流程
+## Workflow
 
-### 1. 打开视频
+### 1. Open Video
 
-菜单 `文件 → 打开视频` (Ctrl+O) 或点击工具栏 `打开视频`。
+Menu `File → Open Video` (Ctrl+O) or click toolbar `Open Video`.
 
-### 2. 绘制暖点核心 ROI
+### 2. Draw Warm-Spot Core ROI
 
-在视频上按住鼠标左键拖拽，圈定暖点圆片区域（椭圆）。
+Click and drag on the video to outline the warm-spot disc area (ellipse).
 
-视频上会显示三个 ROI：
-- **ROI A** (绿色实线): 暖点核心，用于判断是否被遮挡
-- **ROI B** (黄色虚线): 缓冲 ROI (=ROI A × 1.8)，用于粗筛
-- **ROI C** (蓝色虚线): 计数 ROI (=ROI A × 1.6)，用于小鼠数量估计
+Three ROIs are displayed on the video:
+- **ROI A** (green solid line): Warm-spot core, used to determine occlusion
+- **ROI B** (yellow dashed line): Buffer ROI (= ROI A × 1.8), used for coarse screening
+- **ROI C** (blue dashed line): Counting ROI (= ROI A × 1.6), used for mouse count estimation
 
-### 3. 标记参考帧（任意顺序）
+### 3. Mark Reference Frames (any order)
 
-校准按钮在工具栏中：
+Calibration buttons are in the toolbar:
 
-| 按钮 | 用途 | 统计方式 |
+| Button | Purpose | Statistics Method |
 |---|---|---|
-| `[0]` 标记0只 | 空场背景帧（必须至少一个） | 取最后一帧 |
-| `[1]` 标记1只 | 单鼠面积校准 | 多帧取 P80 |
-| `[2]` 标记2只 | 双鼠参考面积 | 多帧取中位数 |
-| `[3]` 标记3只 | 三鼠参考面积 | 多帧取中位数 |
-| `[4]` 标记4只 | 四鼠参考面积 | 多帧取中位数 |
+| `[0]` Mark 0 | Empty background frame (at least one required) | Last frame used |
+| `[1]` Mark 1 | Single-mouse area calibration | P80 across frames |
+| `[2]` Mark 2 | Two-mouse reference area | Median across frames |
+| `[3]` Mark 3 | Three-mouse reference area | Median across frames |
+| `[4]` Mark 4 | Four-mouse reference area | Median across frames |
 
-- **左键点击** = 追加样本（不限次数）
-- **右键点击** = 撤回/清空菜单
-- 按钮显示当前样本数，如 `[2] 2只 x3/3`
-- 不强制顺序：先点 [1] 再点 [0] 也能正常生效（[0] 出现后自动重测之前标记的帧）
-- 无背景时按 `R` 使用 dark-only fallback 模式（置信度降低）
+- **Left click** = append sample (unlimited)
+- **Right click** = undo/clear menu
+- Button shows current sample count, e.g. `[2] 2 mice x3/3`
+- Order is not enforced: marking [1] before [0] works fine (previous frames are re-tested once [0] is available)
+- Without a background, press `R` to use dark-only fallback mode (lower confidence)
 
-### 4. 自动检测全视频
+### 4. Auto-Detect Full Video
 
-点击 `自动检测全视频` → 后台运行两层检测：
+Click `Auto-Detect Full Video` → runs two-layer detection in background:
 
-- **Layer 1** — 隔帧粗筛 (ROI B) → 局部精查 (ROI A) → 状态机 → 占据大事件 (OccupancyEpisode)
-- **Layer 2** — 在占据事件内逐帧估计小鼠数量 → 按数量变化切分 → 计数子片段 (CountSegment)
+- **Layer 1** — Coarse screening every N frames (ROI B) → fine local inspection (ROI A) → state machine → OccupancyEpisode
+- **Layer 2** — Within each episode, estimate mouse count frame by frame → split by count changes → CountSegments
 
-检测完成后事件列表自动填充，等待人工审核。达到空档阈值的交替间隔会显示为灰色“估计数量 0”行；该行可选中检查，并与其他 CountSegment 一样进入 CSV/Markdown 导出。
+After detection completes, the event list populates automatically, awaiting manual review. Gap intervals that meet the threshold appear as gray "estimated count 0" rows; these rows are selectable and exported to CSV/Markdown like any other CountSegment.
 
-### 5. 人工审核
+### 5. Manual Review
 
-| 操作 | 快捷键 |
+| Action | Shortcut |
 |---|---|
-| 选择小鼠身份 (多选 toggle) | `1` `2` `3` `4` |
-| 确认当前片段数量 | `Shift+0` `Shift+1` `Shift+2` |
-| 刷新当前帧计数 | `R` |
-| 播放/暂停 | `Space` |
-| 单帧前进/后退 | `→` `←` |
-| 快进/快退 10 帧 | `J` `L` |
-| 上一个/下一个事件 | `↑` `↓` |
-| 保存并跳到下一个 | `Enter` |
-| 标记误检 | `X` |
-| 拆分片段 (当前帧) | `C` 或 `K` |
+| Select mouse identity (multi-select toggle) | `1` `2` `3` `4` |
+| Confirm segment mouse count | `Shift+0` `Shift+1` `Shift+2` |
+| Refresh current frame count | `R` |
+| Play/Pause | `Space` |
+| Frame forward/back | `→` `←` |
+| Fast forward/back 10 frames | `J` `L` |
+| Previous/Next event | `↑` `↓` |
+| Save & jump to next | `Enter` |
+| Mark false detection | `X` |
+| Split segment (at current frame) | `C` or `K` |
 
-标注面板操作：
-- `[v] 确认` — 确认当前片段的小鼠标注
-- `[x] 误检` — 标记当前片段为误检
-- `保存并下一个` — 保存并自动跳到下一个待审核片段
+Annotation panel actions:
+- `[v] Confirm` — Confirm mouse annotation for current segment
+- `[x] False Detection` — Mark current segment as false detection
+- `Save & Next` — Save and auto-jump to next pending segment
 
-### 5.1 颜色→鼠号自动记忆
+### 5.1 Color → Mouse ID Auto-Memory
 
-颜色识别得到完整、非冲突的已知颜色时，系统自动分配最小可用鼠号（1–4），例如首次 green→1、red→2；同色后续复用既有编号，不同颜色不会自动共用编号。映射保存在用户目录 `~/.mouse_warm_spot/color_mouse_mapping.json`，不含任何密钥。unknown、重复双鼠颜色、冲突、测温器干扰、0 鼠 clip 和人工 confirmed 事件均不会自动分配/覆盖，而是保守标记复核。
+When color recognition yields complete, non-conflicting known colors, the system automatically assigns the smallest available mouse ID (1–4). For example, green → 1 on first encounter, red → 2 next; subsequent same-color segments reuse the existing mapping. Different colors are not automatically assigned the same number. The mapping is saved in `~/.mouse_warm_spot/color_mouse_mapping.json` and contains no keys. Unknown, duplicate two-mouse colors, conflicts, thermometer interference, zero-mouse clips, and manually confirmed events are never auto-assigned/overwritten — they are conservatively flagged for review.
 
-在 **视图 → 管理颜色-鼠号映射...** 可查看当前映射并“重置全部映射”。全部事件批处理结束会弹出总数、成功、测温器干扰、需复核、失败/取消和当前映射摘要；单事件状态栏显示自动分配的鼠号。
+Use **View → Manage Color-Mouse Mapping...** to inspect the current mapping and "Reset All Mappings". After batch processing all events, a summary dialog shows total, successful, thermometer-interference, needs-review, failed/cancelled counts and the current mapping. The status bar shows the auto-assigned mouse ID for single events.
 
-### 6. 导出
+### 6. Export
 
-菜单 `文件 → 导出CSV...` 导出精简 CSV（5 字段：segment_id | start_time_sec | end_time_sec | mouse_count | mouse_ids），以手动标记的 mouse_ids 为准。`文件 → 导出Markdown统计表...` 生成报告，包含：
-- 事件明细表（每段起止时间、小鼠编号、数量）
-- 每只小鼠汇总（总占据时长、事件次数）
-- 暖点汇总（总被占据时长、多鼠事件数）
+Menu `File → Export CSV...` exports a simplified CSV (5 fields: segment_id | start_time_sec | end_time_sec | mouse_count | mouse_ids) based on manually marked mouse_ids. `File → Export Markdown Statistics...` generates a report including:
+- Event detail table (start/end time, mouse IDs, count per segment)
+- Per-mouse summary (total occupation duration, event count)
+- Warm-spot summary (total occupation duration, multi-mouse event count)
 
 ---
 
-## 检测算法概要
+## Detection Algorithm Summary
 
-### 占据检测 (Layer 1)
+### Occupancy Detection (Layer 1)
 
-1. 每隔 10 帧对 ROI B 采样，计算遮挡比例
-2. 遮挡比例 ≥ 20% → 触发精细扫描
-3. 对 ROI A 逐帧计算 5 项指标（暖色保留、深色比例、背景差异等）
-4. 状态机仅以 **ROI Core（内圈）** 的连续性判断 clip 边界：连续 4 帧 ≥ 20% 确认进入；Core 连续空闲达到 `core_gap_tolerance_seconds`（默认 **0.3 秒**）即结束/split。空闲的双条件为 `is_occupied=false`，**或**综合 `occlusion_area_ratio` 低于 `core_empty_occupancy_threshold`（默认 **0.04**，范围严格 clamp 到 0~1）；后者优先于可能过时的 occupied 标记。阈值刻意低于 8% release 阈值，避免正常近阈值噪声切段。
-5. 两个已确认的占领 clip 之间，达到该阈值的 Core 空闲帧会生成独立、可导出的 `estimated_mouse_count=0` CountSegment（`start_reason=core_empty_gap`）；其 debug 字段含 `core_empty_reason` 和 min/max/mean/threshold occupancy。不会为视频开头/结尾背景生成 0 clip，也不会被合并跨越。
-6. ROI Count（外圈）只用于粗筛和数量估计；外圈仍有鼠活动不能维持或合并一个 Core clip。为避免粗筛窗口重叠产生重复，后处理只去重**重叠**事件，绝不按时间空档合并两个 Core episode。检测日志会记录 `core_gap` 分割规则。
-7. 过滤 < 0.8 秒的过短事件；如实验视频帧率或噪声特性不同，可在传给 `DetectionEngine.detect` / `detect_with_counting` 的参数字典中设置 `core_gap_tolerance_seconds`。
+1. Sample ROI B every 10 frames, calculate occlusion ratio
+2. Occlusion ratio ≥ 20% → trigger fine scanning
+3. Compute 5 metrics per frame for ROI A (warm color retention, dark pixel ratio, background difference, etc.)
+4. State machine determines clip boundaries solely by **ROI Core (inner circle)** continuity: 4 consecutive frames ≥ 20% confirms entry; Core idle for `core_gap_tolerance_seconds` (default **0.3s**) ends/splits the clip. Idle is defined as `is_occupied=false` **or** composite `occlusion_area_ratio` below `core_empty_occupancy_threshold` (default **0.04**, strictly clamped to 0–1); the latter takes priority over potentially stale occupied flags. The threshold is deliberately below the 8% release threshold to avoid splitting on normal near-threshold noise.
+5. Between two confirmed occupancy clips, any Core idle frames meeting the threshold produce an independent `estimated_mouse_count=0` CountSegment (`start_reason=core_empty_gap`); its debug fields include `core_empty_reason` and min/max/mean/threshold occupancy. No 0-clips are generated for video start/end background, and they are never merged across.
+6. ROI Count (outer circle) is only used for coarse screening and count estimation; a mouse still active in the outer ring cannot sustain or merge a Core clip. To avoid overlapping coarse screening windows producing duplicates, post-processing only deduplicates **overlapping** events — it never merges two Core episodes across a time gap. Detection logs record the `core_gap` split rule.
+7. Filter episodes shorter than 0.8s; for videos with different frame rates or noise characteristics, adjust `core_gap_tolerance_seconds` via the parameter dict passed to `DetectionEngine.detect` / `detect_with_counting`.
 
-### 小鼠计数 (Layer 2)
+### Mouse Counting (Layer 2)
 
-保守计数策略，核心原则：**单个连通区最多判 2 只，绝不判 3/4**。
+Conservative counting strategy. Core principle: **a single connected component is capped at 2 mice; 3 or 4 are never inferred**.
 
 ```
-前景提取 (ROI C 内):
-  strong_dark (V < 55) | (dark_candidate (V < 95) & 背景差异 > 25)
-  → 形态学去噪 (开3x3 + 闭9x9)
-  → 连通区分析
-  → 仅保留与 ROI Core 直接重叠（≥20px 且 ≥Core 2%）或在明确 3px 容差内接触的前景块；ROI Count 外圈独立块排除
-  → 对保留块碎片合并 (Union-Find 近邻聚类)
-  → 过滤: 面积 < 50px、长宽比 > 5
+Foreground extraction (within ROI C):
+  strong_dark (V < 55) | (dark_candidate (V < 95) & background diff > 25)
+  → morphological denoising (open 3x3 + close 9x9)
+  → connected component analysis
+  → keep only components directly overlapping ROI Core (≥20px and ≥Core 2%) or touching Core within a clear 3px tolerance; outer ROI Count independent blobs are excluded
+  → merge fragmented blobs (Union-Find nearest-neighbor clustering)
+  → filter: area < 50px, aspect ratio > 5
 
-计数:
-  count_by_blob = 合并后接触 ROI A 的连通区数 (0~4)
-  count_by_area = 总面积 / 单鼠参考面积 → 阈值映射 (< 1.7=1, 1.7-2.7=2, ...)
+Counting:
+  count_by_blob = number of merged components touching ROI A (0–4)
+  count_by_area = total area / single-mouse reference area → threshold mapping (< 1.7=1, 1.7–2.7=2, ...)
 
-综合判定:
-  blob=0               → 0只, 0.9
+Composite decision:
+  blob=0               → 0 mice, 0.9
 
-调试字段：`core_connected_blob_count`、`ignored_outer_blob_count`、`core_connected_area` 分别显示参与计数的 Core 连通块数、被排除的外圈独立块数和仅 Core 连通块的面积。
-  blob=1, ratio<1.7    → 1只, 0.85
-  blob=1, 1.7≤r<2.7    → 2只, 0.35 (低置信)
-  blob=1, r≥2.7        → 2只, 0.25 (极低置信)
-  blob=1, 有参考面积匹配 → 采用匹配结果 (偏差<35%)
-  blob≥2               → 相信blob数, 结合面积
+Debug fields: `core_connected_blob_count`, `ignored_outer_blob_count`, `core_connected_area` show the number of Core-connected blobs used for counting, excluded outer independent blobs, and the area of Core-connected blobs only.
+  blob=1, ratio<1.7    → 1 mouse, 0.85
+  blob=1, 1.7≤r<2.7    → 2 mice, 0.35 (low confidence)
+  blob=1, r≥2.7        → 2 mice, 0.25 (very low confidence)
+  blob=1, reference area match → use match result (deviation <35%)
+  blob≥2               → trust blob count, combined with area
 
-时间稳定性: 1→2需8帧, 2→3需10帧, 1→3需15帧+额外证据
+Temporal stability: 1→2 requires 8 frames, 2→3 requires 10 frames, 1→3 requires 15 frames + additional evidence
 ```
 
 ---
 
-## 快捷键总览
+## Keyboard Shortcuts Reference
 
-| 键 | 功能 |
+| Key | Function |
 |---|---|
-| `1` `2` `3` `4` | 选择/取消小鼠身份 |
-| `Shift+0` `Shift+1` `Shift+2` | 确认片段小鼠数量（互斥选中） |
-| `R` | 刷新当前帧计数 |
-| `Space` | 播放/暂停 |
-| `→` `←` | 单帧前进/后退 |
-| `J` `L` | 快进/快退 10 帧 |
-| `↑` `↓` | 上一个/下一个事件 |
-| `Enter` | 保存并跳到下一个 |
-| `X` | 标记误检 |
-| `C` `K` | 在当前帧拆分片段 |
-| `S` | 保存当前标注 |
+| `1` `2` `3` `4` | Select/deselect mouse identity |
+| `Shift+0` `Shift+1` `Shift+2` | Confirm segment mouse count (exclusive selection) |
+| `R` | Refresh current frame count |
+| `Space` | Play/Pause |
+| `→` `←` | Frame forward/back |
+| `J` `L` | Fast forward/back 10 frames |
+| `↑` `↓` | Previous/Next event |
+| `Enter` | Save & jump to next |
+| `X` | Mark as false detection |
+| `C` `K` | Split segment at current frame |
+| `S` | Save current annotation |
 
 ---
 
-## 菜单
+## Menus
 
-| 菜单 | 功能 |
+| Menu | Function |
 |---|---|
-| 文件 → 打开视频 (Ctrl+O) | 打开 mp4/avi/mov 等视频 |
-| 文件 → 保存/加载 ROI | 保存/加载暖点 ROI 坐标 (JSON) |
-| 文件 → 保存/加载背景帧 | 保存/加载空场背景图像 (PNG) |
-| 文件 → 导出Markdown统计表... | 导出标注结果 |
-| 文件 → 退出 (Ctrl+Q) | 退出程序 |
-| 视图 → 暖点放大窗口 | 显示/隐藏放大窗口 |
-| 视图 → 检测指标 | 显示/隐藏指标面板 |
-| 视图 → Debug 视图 | 显示/隐藏原始检测标注叠加 |
-| 视图 → 管理颜色-鼠号映射... | 查看/重置颜色到鼠号的持久映射 |
+| File → Open Video (Ctrl+O) | Open mp4/avi/mov etc. |
+| File → Save/Load ROI | Save/Load warm-spot ROI coordinates (JSON) |
+| File → Save/Load Background Frame | Save/Load empty background image (PNG) |
+| File → Export Markdown Statistics... | Export annotation results |
+| File → Exit (Ctrl+Q) | Exit application |
+| View → Warm-spot Zoom Window | Show/Hide zoom window |
+| View → Detection Metrics | Show/Hide metrics panel |
+| View → Debug View | Show/Hide raw detection annotation overlay |
+| View → Manage Color-Mouse Mapping... | View/Reset persistent color-to-mouse-id mapping |
